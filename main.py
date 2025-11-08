@@ -300,7 +300,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
 
         if args.baseline == 'slora' and epoch == args.R_1:
             model, tokenizer = model_and_tokenizer(global_model=args.global_model, device_map='auto')
-            get_peft_model(model, config, adapter_name='local')
+            # IMPORTANT: get_peft_model returns a wrapped model; assign it back
+            model = get_peft_model(model, config, adapter_name='local')
 
         # training for each client
         for k, client_id in enumerate(selected_clients_set):
