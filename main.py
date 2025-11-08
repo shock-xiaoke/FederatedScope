@@ -384,7 +384,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             else:
                 current_count += 1
             if current_count > patience:
-                logging.info("Best round is", best_round, "with test_rouge_L", best_rouge_L)
+                logging.info(f"Best round is {best_round} with test_rouge_L {best_rouge_L}")
                 return
 
 def main():
