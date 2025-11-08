@@ -101,55 +101,19 @@ def read_options():
     return args
 
 
-def model_and_tokenizer(global_model, device_map='auto', use_4bit=True, dtype='bf16'):
-    # dtype 解析
-    dtype_map = {'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp32': torch.float32}
-    torch_dtype = dtype_map.get(dtype, torch.bfloat16)
-
+def model_and_tokenizer(global_model, device_map='auto'):
+    model = AutoModelForCausalLM.from_pretrained(
+        global_model,
+        torch_dtype=torch.bfloat16,
+        device_map=device_map,
+        trust_remote_code=True,
+    )
+    model.gradient_checkpointing_enable()
+    model.config.use_cache = False
     tokenizer = AutoTokenizer.from_pretrained(global_model, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
-
-    if use_4bit:
-        bnb = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch_dtype,
-        )
-        # 先尝试：量化 + device_map="auto"
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                global_model,
-                quantization_config=bnb,
-                device_map=device_map,              # 先走 auto
-                trust_remote_code=True,
-            )
-        except ValueError as e:
-            # 兼容老版本：遇到 “.to is not supported for 4-bit/8-bit” 就去掉 device_map 重试
-            if "`.to` is not supported for `4-bit` or `8-bit` models" in str(e):
-                model = AutoModelForCausalLM.from_pretrained(
-                    global_model,
-                    quantization_config=bnb,
-                    trust_remote_code=True           # 不传 device_map，避免 dispatch_model 调 .to()
-                )
-            else:
-                raise
-    else:
-        # 不用 4bit 时，正常用 bf16/fp16 + device_map
-        model = AutoModelForCausalLM.from_pretrained(
-            global_model,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-            trust_remote_code=True,
-        )
-
-    # 训练期建议的省显存设置
-    try:
-        model.gradient_checkpointing_enable()
-    except Exception:
-        pass
-    model.config.use_cache = False
     return model, tokenizer
 
 
