@@ -93,8 +93,9 @@ class GeneralClient:
                             density=None,
                             lambd=None,
                             reg = None):
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
-        ddp = world_size != 1
+        # world_size = int(os.environ.get("WORLD_SIZE", 1))
+        # ddp = world_size != 1
+        ddp = False
         class reg_Trainer(transformers.Trainer):
             def compute_loss(self, model, inputs, return_outputs=False):
                 outputs = model(**inputs)
@@ -133,8 +134,8 @@ class GeneralClient:
                 'rougeL': round(rouge_output["rougeL"], 4),
                 'rougeLsum': round(rouge_output["rougeLsum"], 4)
             }
-        if ddp:
-            gradient_accumulation_steps = gradient_accumulation_steps // world_size
+        # if ddp:
+        #     gradient_accumulation_steps = gradient_accumulation_steps // world_size
         self.train_args = transformers.TrainingArguments(
             per_device_train_batch_size=local_micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -152,7 +153,7 @@ class GeneralClient:
             output_dir=self.local_output_dir,
             # save_total_limit=1,
             # load_best_model_at_end=True,
-            ddp_find_unused_parameters=False if ddp else None,
+            # ddp_find_unused_parameters=False if ddp else None,
             group_by_length=group_by_length,
             dataloader_drop_last=False,
         )

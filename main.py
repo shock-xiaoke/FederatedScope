@@ -1,9 +1,10 @@
 from tqdm import tqdm
 from scipy.stats import norm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import (
     LoraConfig,
     get_peft_model,
+    prepare_model_for_kbit_training,
 )
 from fed_utils import FedAvg, client_selection, seed_torch, GeneralClient, FlexLoRA, \
     load_weight_local, distribute_weight_fast, modify_adapter, load_weight_SLoRA
@@ -102,20 +103,30 @@ def model_and_tokenizer(global_model, device_map='auto'):
     """
     setting up model and tokenizer
     """
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    ddp = world_size != 1
-    if ddp:
-        device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
+    # world_size = int(os.environ.get("WORLD_SIZE", 1))
+    # ddp = world_size != 1
+    # if ddp:
+    #     device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16
+    )
 
     model = AutoModelForCausalLM.from_pretrained(
         global_model,
-        device_map=device_map, trust_remote_code=True)
+        device_map=device_map, trust_remote_code=True,
+        quantization_config=bnb_config
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(global_model)
     tokenizer.pad_token_id = (
         0
     )
     tokenizer.padding_side = "left"
+    model = prepare_model_for_kbit_training(model)
     return model, tokenizer
 
 def get_peft(config_types, num_clients, strategy=None):
@@ -441,11 +452,11 @@ def main():
     )
     if args.baseline != 'slora':
         model = get_peft_model(model, config, adapter_name = 'local')
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    ddp = world_size != 1
-    if not ddp and torch.cuda.device_count() > 1:
-        model.is_parallelizable = True
-        model.model_parallel = True
+    # world_size = int(os.environ.get("WORLD_SIZE", 1))
+    # ddp = world_size != 1
+    # if not ddp and torch.cuda.device_count() > 1:
+    #     model.is_parallelizable = True
+    #     model.model_parallel = True
 
     FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_local=config_local, config=config, config_types=config_types)
 
