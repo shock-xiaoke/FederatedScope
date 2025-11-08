@@ -90,9 +90,11 @@ def read_options():
                         help='LoRA alpha')
     parser.add_argument('--lora_dropout', default=0.05, type=float,
                         help='LoRA dropout')
-    parser.add_argument('--lora_target_modules', default=['q_proj', 'v_proj', 'k_proj', 'o_proj',
-                                                          'gate_proj', 'down_proj', 'up_proj'
-                                                          ], type=list,
+    # parser.add_argument('--lora_target_modules', default=['q_proj', 'v_proj', 'k_proj', 'o_proj',
+    #                                                       'gate_proj', 'down_proj', 'up_proj'
+    #                                                       ], type=list,
+    #                     help='lora_target_modules')
+    parser.add_argument('--lora_target_modules', default=['q_proj', 'v_proj'], type=list,
                         help='lora_target_modules')
 
     args = parser.parse_args()
