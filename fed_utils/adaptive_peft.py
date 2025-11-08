@@ -62,10 +62,11 @@ def load_weight_SLoRA(weighted_single_weights, model):
                 if key_check in name and 'lora_A' in name:
                     rank = min(param.shape)
                     merge_rate = 16/rank
-                    u, s, v = torch.svd(weight_dict[key])
+                    W_cpu = weight_dict[key].detach().to('cpu')
+                    u, s, vT = torch.linalg.svd(W_cpu, full_matrices=False)
                     u = u[:, :rank]
                     s = s[:rank]
-                    v = v.T[:rank, :]
+                    v = vT[:rank, :]
                     lora_B = u @ torch.diag(s)/merge_rate
                     lora_A = v
                     model_tune_param[name] = lora_A
@@ -81,10 +82,11 @@ def distribute_weight(weighted_single_weights, model):
         # _, target, target_name = peft.utils.other._get_submodules(model, key + '_A.local')
         rank = 2048
         merge_rate = 16 / rank
-        u, s, v = torch.svd(weighted_single_weights[key]/merge_rate)
+        W_cpu = (weighted_single_weights[key] / merge_rate).detach().to('cpu')
+        u, s, vT = torch.linalg.svd(W_cpu, full_matrices=False)
         u = u[:, :rank]
         s = s[:rank]
-        v = v.T[:rank, :]
+        v = vT[:rank, :]
         lora_B = u @ torch.diag(s)
         lora_A = v
         weight_dict[key + '_A.local.weight'] = lora_A
@@ -107,7 +109,8 @@ def distribute_weight_fast(weighted_single_weights, config_local):
                     rank_dict[key] = [val[key]]
 
     for key in tqdm(weighted_single_weights.keys()):
-        u, s, v = torch.svd(weighted_single_weights[key])
+        W_cpu = weighted_single_weights[key].detach().to('cpu')
+        u, s, vT = torch.linalg.svd(W_cpu, full_matrices=False)
         for layer, rank_lst in rank_dict.items():
             if layer in key:
                 break
@@ -115,7 +118,7 @@ def distribute_weight_fast(weighted_single_weights, config_local):
             if rank != 0:
                 U = u[:, :rank]
                 S = s[:rank]
-                V = v.T[:rank, :]
+                V = vT[:rank, :]
                 lora_B = U @ torch.diag(S)
                 lora_A = V
                 # merge_rate = 2

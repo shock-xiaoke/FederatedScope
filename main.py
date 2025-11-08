@@ -101,33 +101,46 @@ def read_options():
 
 def model_and_tokenizer(global_model, device_map='auto'):
     """
-    setting up model and tokenizer
+    setting up model and tokenizer（省显存版：4bit 或 BF16）
     """
-    # world_size = int(os.environ.get("WORLD_SIZE", 1))
-    # ddp = world_size != 1
-    # if ddp:
-    #     device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
+    # ——优先用 4bit QLoRA；如果没装 bitsandbytes，会自动回退到 bf16——
+    bnb = None
+    try:
+        bnb = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,  # A6000 建议 bf16
+        )
+    except Exception:
+        bnb = None
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16
-    )
+    if bnb is not None:
+        model = AutoModelForCausalLM.from_pretrained(
+            global_model,
+            quantization_config=bnb,
+            device_map=device_map,
+            trust_remote_code=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            global_model,
+            torch_dtype=torch.bfloat16,   # 没有 4bit 就用 bf16
+            device_map=device_map,
+            trust_remote_code=True,
+        )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        global_model,
-        device_map=device_map, trust_remote_code=True,
-        quantization_config=bnb_config
-    )
+    # 训练期建议开启梯度检查点、关闭 KV cache
+    try:
+        model.gradient_checkpointing_enable()
+    except Exception:
+        pass
+    model.config.use_cache = False
 
     tokenizer = AutoTokenizer.from_pretrained(global_model)
-    tokenizer.pad_token_id = (
-        0
-    )
+    tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
-    model = prepare_model_for_kbit_training(model)
     return model, tokenizer
+
 
 def get_peft(config_types, num_clients, strategy=None):
     """

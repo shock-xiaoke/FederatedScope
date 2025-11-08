@@ -34,7 +34,7 @@ def FedAvg(selected_clients_set, output_dir, local_dataset_len_dict, epoch):
         torch.cuda.empty_cache()
 
     # set_peft_model_state_dict(model, weighted_single_weights, "default")
-
+    torch.cuda.empty_cache()
     return weighted_single_weights
 
 def truncate(selected_clients_set, output_dir, local_dataset_len_dict, epoch, handle_alpha = False):
@@ -67,6 +67,7 @@ def truncate(selected_clients_set, output_dir, local_dataset_len_dict, epoch, ha
             del single_weights
             # gc.collect()
             torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
     return weighted_single_weights
 
 def FlexLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch):
@@ -95,4 +96,5 @@ def FlexLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch):
             del single_weights
             # gc.collect()
             torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
     return weighted_single_weights

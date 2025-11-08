@@ -157,6 +157,30 @@ class GeneralClient:
             group_by_length=group_by_length,
             dataloader_drop_last=False,
         )
+        # 只训练 LoRA：冻结基座 + 收集 lora_* 参数
+        for name, p in self.model.named_parameters():
+            if 'lora_' not in name:
+                p.requires_grad = False
+        lora_params = [p for n, p in self.model.named_parameters()
+                       if ('lora_' in n and p.requires_grad)]
+
+        # 优先使用 bitsandbytes 的 8bit Adam；没有就退回 AdamW
+        try:
+            from bitsandbytes.optim import Adam8bit
+            optimizer = Adam8bit(lora_params, lr=local_learning_rate)
+        except Exception:
+            optimizer = torch.optim.AdamW(lora_params, lr=local_learning_rate)
+
+        # 简单的线性 warmup + 线性衰减日程
+        steps_per_epoch = max(1, len(self.local_train_dataset) // max(1, local_micro_batch_size))
+        update_steps_per_epoch = max(1, steps_per_epoch // max(1, gradient_accumulation_steps))
+        total_steps = max(1, update_steps_per_epoch * max(1, int(local_num_epochs)))
+        scheduler = transformers.get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup,
+            num_training_steps=total_steps,
+        )
+
         if self.hetero_lora:
             if self.mask:
                 self.local_trainer = reg_Trainer(model=self.model,
@@ -202,6 +226,7 @@ class GeneralClient:
                                                           data_collator=transformers.DataCollatorForSeq2Seq(
                                                               tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
                                                           ),
+                                                          optimizers=(optimizer, scheduler),
                                                           compute_metrics=compute_metrics
                                                           )
 
