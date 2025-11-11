@@ -7,7 +7,7 @@ from peft import (
     prepare_model_for_kbit_training,
 )
 from fed_utils import FedAvg, client_selection, seed_torch, GeneralClient, FlexLoRA, \
-    load_weight_local, distribute_weight_fast, modify_adapter, load_weight_SLoRA
+    load_weight_local, distribute_weight_fast, modify_adapter, load_weight_SLoRA, FedHera
 
 import datasets
 from datasets import load_dataset
@@ -41,8 +41,13 @@ def read_options():
                         help='random seed')
 
     ## FL parameters
-    parser.add_argument('--aggregation', default='homo', type=str,
-                        help='aggregation method', choices=['homo','random','heavy_tail','heavy_tail_strong','normal'])
+    # parser.add_argument('--aggregation', default='homo', type=str,
+    #                     help='aggregation method', choices=['homo','random','heavy_tail','heavy_tail_strong','normal'])
+    parser.add_argument('--aggregation', default='homo', type=str, help = 'aggregation method',
+                        choices = ['homo', 'random', 'heavy_tail', 'heavy_tail_strong', 'normal', 'fedhera'])
+    parser.add_argument('--hetero_mode', default='heavy_tail', type=str,
+                        choices = ['random', 'normal', 'heavy_tail'], help = 'resource heterogeneity mode for Fed-Hera')
+    parser.add_argument('--basis_update_every', default=5, type=int)
     parser.add_argument('--baseline', default='fedavg', type=str,
                         help='type of FL baselines to choose', choices=['fedavg', 'slora', 'fedit'])
     parser.add_argument('--client_selection_frac', default=0.05, type=float,
@@ -102,12 +107,14 @@ def read_options():
 
 
 def model_and_tokenizer(global_model, device_map='auto'):
-    model = AutoModelForCausalLM.from_pretrained(
-        global_model,
-        torch_dtype=torch.bfloat16,
-        device_map=device_map,
-        trust_remote_code=True,
-    )
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     global_model,
+    #     torch_dtype=torch.bfloat16,
+    #     device_map=device_map,
+    #     trust_remote_code=True,
+    # )
+    model = AutoModelForCausalLM.from_pretrained(global_model,device_map = device_map,
+                                                trust_remote_code = True,torch_dtype = torch.bfloat16)
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
     tokenizer = AutoTokenizer.from_pretrained(global_model, trust_remote_code=True)
@@ -308,8 +315,16 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             train_path = data_path + '/local_training_' + str(client_id) + '.json'
             train_data = load_dataset("json", data_files=train_path, cache_dir=args.cache_dir)
             local_dataset_len_dict[client_id] = len(train_data['train'])
-
             total_data_num += local_dataset_len_dict[client_id]
+
+            # Fed-Hera: 尝试加载 server_push 包（若本轮生成）
+            from fed_utils.adaptive_peft import load_weight_fedhera_if_exists, apply_lora_prefix_mask
+            pkg, meta = load_weight_fedhera_if_exists(output_dir, client_id, epoch)
+            if pkg is not None:
+                _ = model.load_state_dict(pkg, strict=False)
+                # 根据 meta 设置每层 r_main 的前缀门控
+                per_layer_r_main = {k: int(v.get("r_main", 0)) for k, v in meta.items() if not v.get("skip", False)}
+                apply_lora_prefix_mask(model, per_layer_r_main)
 
             if args.baseline == 'slora' and args.R_1 == epoch:
                 local_weight = load_weight_SLoRA(global_params, model)
@@ -364,6 +379,19 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                                    epoch,
                                    )
             torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
+        elif args.aggregation == 'fedhera':
+            # Fed-Hera: 生成每客户端下发包 + 返回全局Wg（可选保存做日志）
+                      _ = FedHera(selected_clients_set,
+                                                           output_dir,
+                                                           local_dataset_len_dict,
+                                                           epoch,
+                                                           client_budgets = FL_training.client_budgets,
+                                  layer_specs = FL_training.layer_specs,
+                                  quant_scheme = ("bfloat16", "nf4"),
+                                  use_gpu_svd = False,
+                                  basis_update_every = args.basis_update_every)
+            # adapter_model.bin 可存聚合Wg，便于可视化/对照
+                      torch.save(_, os.path.join(output_dir, "adapter_model.bin"))
         else:
             global_params = FlexLoRA(selected_clients_set,
                                    output_dir,
@@ -419,6 +447,42 @@ def main():
 
     prompter = Prompter(args.prompt_template_name)
 
+    # 对每层记录 (d_out, d_in)，提供给 Fed-Hera 的分配器做字节估算
+    layer_specs = {}
+
+    for name, param in model.named_parameters():
+
+        if "lora_A" in name or "lora_B" in name:
+            base_key = '.'.join(name.split('.')[:-3]) + '.lora'
+            if base_key not in layer_specs:
+                if "lora_A" in name:
+                    r, d_in = param.shape
+                    # 对应 B 的形状稍后由伙伴参数获取
+                    layer_specs[base_key] = {"d_out": None, "d_in": int(d_in)}
+                else:
+                    d_out, r = param.shape
+                    if base_key not in layer_specs:
+                        layer_specs[base_key] = {"d_out": int(d_out), "d_in": None}
+                    else:
+                        layer_specs[base_key]["d_out"] = int(d_out)
+    # 补全空值
+
+    for k, v in layer_specs.items():
+        if v["d_out"] is None or v["d_in"] is None:
+            # 粗略补全：如果某层只出现一侧，取另一侧出现的维度
+            for name, p in model.named_parameters():
+                if k in name:
+                    if v["d_out"] is None and "lora_B" in name:
+                        v["d_out"] = int(p.shape[0])
+                    if v["d_in"] is None and "lora_A" in name:
+                        v["d_in"] = int(p.shape[1])
+
+    # 生成 Fed-Hera 的 per-client 预算
+    client_budgets = build_fedhera_budgets(args.num_clients, args.hetero_mode, seed=args.seed)
+    # 传入训练循环（避免函数签名大改）
+    FL_training.layer_specs = layer_specs
+    FL_training.client_budgets = client_budgets
+
     config_types = {
         'Type_0': {'q_proj': 8, 'v_proj': 8, 'k_proj': 8, 'o_proj': 8, 'gate_proj': 8, 'down_proj': 8, 'up_proj': 8},
         'Type_1': {'q_proj': 200, 'v_proj': 200, 'k_proj': 200, 'o_proj': 200, 'gate_proj': 200, 'down_proj': 200,
@@ -448,6 +512,54 @@ def main():
     #     model.model_parallel = True
 
     FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_local=config_local, config=config, config_types=config_types)
+
+
+def _sample_factor(mode, rng):
+    if mode == 'random':
+        return rng.uniform(0.8, 1.2)
+    elif mode == 'normal':
+        f = rng.normal(loc=1.0, scale=0.1)
+        return float(np.clip(f, 0.7, 1.3))
+    else:  # heavy_tail
+        f = rng.lognormal(mean=-0.1, sigma=0.5)
+        return float(np.clip(f, 0.5, 2.0))
+
+def build_fedhera_budgets(num_clients, hetero_mode, seed=42):
+    """
+    返回 Dict[int]-> {"tier": str, "B_down_MB":float, "VRAM_MB":float, "step_ms":float}
+    low/medium/high 对应采样频率由 hetero_mode 决定：heavy_tail 偏向 low。
+    """
+    rng = np.random.default_rng(seed)
+    # tier 基线
+    TIERS = {
+        "low":    {"B_down_MB": 80,  "VRAM_MB": 12000, "step_ms": 350},
+        "medium": {"B_down_MB": 140, "VRAM_MB": 20000, "step_ms": 250},
+        "high":   {"B_down_MB": 240, "VRAM_MB": 32000, "step_ms": 200},
+    }
+    # 采样概率
+    if hetero_mode == 'random':
+        probs = [1/3, 1/3, 1/3]
+    elif hetero_mode == 'normal':
+        probs = [0.25, 0.5, 0.25]
+    else:  # heavy_tail -> 弱算力更多
+        probs = [0.6, 0.3, 0.1]
+    tier_names = ["low","medium","high"]
+
+    client_budgets = {}
+    for i in range(num_clients):
+        tier = rng.choice(tier_names, p=probs)
+        base = TIERS[tier]
+        # 对每项资源加入扰动
+        f_down = _sample_factor(hetero_mode, rng)
+        f_vram = _sample_factor(hetero_mode, rng)
+        f_step = _sample_factor(hetero_mode, rng)
+        client_budgets[i] = {
+            "tier": tier,
+            "B_down_MB": float(base["B_down_MB"] * f_down),
+            "VRAM_MB":   float(base["VRAM_MB"]   * f_vram),
+            "step_ms":   float(base["step_ms"]   / max(f_step, 1e-6))  # 算力强→步时更小
+        }
+    return client_budgets
 
 
 if __name__ == "__main__":

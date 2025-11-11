@@ -14,7 +14,7 @@ def seed_torch(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.enabled = False
 
-from .model_aggregation import FedAvg, FlexLoRA, truncate
+from .model_aggregation import FedAvg, FlexLoRA, truncate, FedHera
 from .client_participation_scheduling import client_selection
 from .client import GeneralClient
 from .adaptive_peft import (seed_torch, tokenize, load_weight_local, distribute_weight_fast, modify_adapter,

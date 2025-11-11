@@ -141,3 +141,55 @@ def modify_adapter(peft_model, adapter_name, modify_module_rank ={},layer_dict =
                 if key in name and isinstance(module, peft.tuners.lora.Linear8bitLt):
                     module.update_layer(adapter_name, r, alpha, lora_dropout, init_lora_weights)
 
+
+# fed_utils/adaptive_peft.py (append)
+import json
+import torch.nn as nn
+
+def apply_lora_prefix_mask(peft_model, per_layer_r_main):
+    """
+    peft_model: PEFT LoRA 模型
+    per_layer_r_main: Dict[layer_key] -> int
+    对 A/B 注册梯度hook：只让前 r_main 列/行产生梯度。
+    """
+    hooks = []
+    for name, param in peft_model.named_parameters():
+        if "lora_A" in name or "lora_B" in name:
+            # name 示例: model.layers.0.self_attn.q_proj.lora_A.local.weight
+            base_key = '.'.join(name.split('.')[:-3]) + '.lora'
+            r_main = int(per_layer_r_main.get(base_key, 0))
+            if r_main <= 0:
+                mask = torch.zeros_like(param, dtype=param.dtype, device=param.device)
+            else:
+                if "lora_A" in name:
+                    # A: [r, d_in] -> 只保留前 r_main 行
+                    mask = torch.zeros_like(param)
+                    mask[:r_main, :] = 1
+                else:
+                    # B: [d_out, r] -> 只保留前 r_main 列
+                    mask = torch.zeros_like(param)
+                    mask[:, :r_main] = 1
+
+            def _make_hook(msk):
+                def hook_fn(grad):
+                    if grad is None: return None
+                    return grad * msk.to(grad.device)
+                return hook_fn
+
+            hooks.append(param.register_hook(_make_hook(mask)))
+    return hooks
+
+def load_weight_fedhera_if_exists(output_dir, client_id, epoch):
+    """
+    若存在 server_push 包，读取并返回 (state_dict, meta)；否则返回 (None, None)
+    """
+    import os, json, torch
+    push_dir = os.path.join(output_dir, str(client_id), f"server_push_epoch_{epoch}")
+    model_path = os.path.join(push_dir, "pytorch_model.bin")
+    meta_path  = os.path.join(push_dir, "meta.json")
+    if os.path.exists(model_path) and os.path.exists(meta_path):
+        state = torch.load(model_path, map_location="cpu")
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        return state, meta
+    return None, None
