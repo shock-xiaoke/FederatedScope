@@ -214,6 +214,9 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             Bkey = layer_key + "_B.local.weight"
             pkg[Akey] = B.float().cpu()  # 注意：我们用B给_A，Vh给_B 与原 distribute_weight_fast 对齐方式保持一致性
             pkg[Bkey] = A.float().cpu()
+            # Correct A/B placement: ensure lora_A gets A and lora_B gets B
+            pkg[Akey] = A.float().cpu()
+            pkg[Bkey] = B.float().cpu()
             meta[layer_key] = {
                 "skip": False, "basis_version": basis_version,
                 "r_tot": rt, "r_main": int(r_main.get(layer_key, 0)),

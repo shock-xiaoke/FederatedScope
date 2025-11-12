@@ -319,12 +319,18 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
 
             # Fed-Hera: 尝试加载 server_push 包（若本轮生成）
             from fed_utils.adaptive_peft import load_weight_fedhera_if_exists, apply_lora_prefix_mask
-            pkg, meta = load_weight_fedhera_if_exists(output_dir, client_id, epoch)
+            prev_epoch = max(0, epoch - 1)
+            pkg, meta = load_weight_fedhera_if_exists(output_dir, client_id, prev_epoch)
             if pkg is not None:
+                # Resize LoRA ranks per layer to r_tot before loading server weights
+                per_layer_r_tot = {k: int(v.get("r_tot", 0)) for k, v in meta.items() if not v.get("skip", False)}
+                if len(per_layer_r_tot) > 0:
+                    modify_adapter(model, 'local', modify_module_rank=per_layer_r_tot,
+                                   lora_alpha=16, lora_dropout=0.05, init_lora_weights=False)
                 _ = model.load_state_dict(pkg, strict=False)
                 # 根据 meta 设置每层 r_main 的前缀门控
                 per_layer_r_main = {k: int(v.get("r_main", 0)) for k, v in meta.items() if not v.get("skip", False)}
-                apply_lora_prefix_mask(model, per_layer_r_main)
+                hera_hooks = apply_lora_prefix_mask(model, per_layer_r_main)
 
             if args.baseline == 'slora' and args.R_1 == epoch:
                 local_weight = load_weight_SLoRA(global_params, model)
@@ -369,6 +375,13 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             logging.info("\nTerminating the local training of Client_{}".format(client_id))
             model, local_dataset_len_dict, previously_selected_clients_set, last_client_id = client.terminate_local_training(
                 epoch, local_dataset_len_dict, previously_selected_clients_set)
+            # Clean up Fed-Hera gradient hooks to avoid accumulation across clients
+            if 'hera_hooks' in locals() and hera_hooks is not None:
+                for _h in hera_hooks:
+                    try:
+                        _h.remove()
+                    except Exception:
+                        pass
             del client
 
             logging.info("Collecting the weights of clients and performing aggregation")
