@@ -146,7 +146,7 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     for layer_key, Wg in aggregated.items():
         device = "cuda" if (use_gpu_svd and torch.cuda.is_available()) else "cpu"
         W = Wg.to(device=device, dtype=torch.float32)  # 用 fp32 做 SVD 更稳定
-        U, S, Vh = torch.linalg.svd(W, full_m=False)
+        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
         # 为节省下行，先回 CPU
         per_layer_USV[layer_key] = {
             "U": U.to("cpu"),
