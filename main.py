@@ -137,6 +137,11 @@ def get_peft(config_types, num_clients, strategy=None):
             for i in range(num_clients):
                 type = 'Type_' + str(np.random.randint(0, 4))
                 config_local['Client_' + str(i)] = config_types[type]
+        elif strategy == 'fedhera':
+            config_local = {'alpha': 16, 'lora_dropout': 0.05}
+            for i in range(num_clients):
+                config_local[f'Client_{i}'] = {}
+            return config_local
         elif strategy == 'heavy_tail':
             config_local = {'alpha':16, 'lora_dropout':0.05}
             for i in range(num_clients):
