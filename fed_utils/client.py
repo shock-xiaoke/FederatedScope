@@ -136,6 +136,10 @@ class GeneralClient:
             }
         # if ddp:
         #     gradient_accumulation_steps = gradient_accumulation_steps // world_size
+        use_cuda = torch.cuda.is_available()
+        major, _ = torch.cuda.get_device_capability(0) if use_cuda else (0, 0)
+        use_bf16 = use_cuda and major >= 8
+
         self.train_args = transformers.TrainingArguments(
             per_device_train_batch_size=local_micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -144,17 +148,13 @@ class GeneralClient:
             learning_rate=local_learning_rate,
             do_train=True,
             do_eval=True,
-            # fp16=True,
-            bf16=True,
+            fp16=use_cuda and not use_bf16,
+            bf16=use_bf16,
             logging_steps=1,
             optim=self.optim,
-            # optim="adamw_torch",
             evaluation_strategy="epoch",
             save_strategy="no",
             output_dir=self.local_output_dir,
-            # save_total_limit=1,
-            # load_best_model_at_end=True,
-            # ddp_find_unused_parameters=False if ddp else None,
             group_by_length=group_by_length,
             dataloader_drop_last=False,
         )
@@ -275,12 +275,16 @@ class GeneralClient:
 
     # TODO: look at logits/LoRA weight difference (norm)
     def test(self, epoch, local_micro_batch_size):
+        use_cuda = torch.cuda.is_available()
+        major, _ = torch.cuda.get_device_capability(0) if use_cuda else (0, 0)
+        use_bf16 = use_cuda and major >= 8
+
         test_args = transformers.TrainingArguments(
             output_dir=self.output_dir,
             do_train=False,
             do_eval=True,
-            # fp16=True,
-            bf16=True,
+            fp16=use_cuda and not use_bf16,
+            bf16=use_bf16,
             per_device_eval_batch_size=local_micro_batch_size,
             dataloader_drop_last=False,
             eval_accumulation_steps=4,

@@ -107,16 +107,34 @@ def read_options():
 
 
 def model_and_tokenizer(global_model, device_map='auto'):
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     global_model,
-    #     torch_dtype=torch.bfloat16,
-    #     device_map=device_map,
-    #     trust_remote_code=True,
-    # )
-    model = AutoModelForCausalLM.from_pretrained(global_model,device_map = device_map,
-                                                trust_remote_code = True,torch_dtype = torch.bfloat16)
+    """
+    Load model and tokenizer and place the model on GPU if available.
+    Prefer bf16 on Ampere+ GPUs, otherwise fall back to fp16/cpu fp32.
+    """
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability()
+        use_bf16 = major >= 8  # Ampere or newer
+        if use_bf16:
+            torch_dtype = torch.bfloat16
+        else:
+            torch_dtype = torch.float16
+        device = 'cuda'
+    else:
+        use_bf16 = False
+        torch_dtype = torch.float32
+        device = 'cpu'
+
+    # Do not rely on Accelerate's device_map here; move explicitly.
+    model = AutoModelForCausalLM.from_pretrained(
+        global_model,
+        trust_remote_code=True,
+        torch_dtype=torch_dtype,
+        device_map=None,
+    )
+    model.to(device)
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
+
     tokenizer = AutoTokenizer.from_pretrained(global_model, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = 0
