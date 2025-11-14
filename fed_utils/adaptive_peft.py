@@ -128,18 +128,31 @@ def distribute_weight_fast(weighted_single_weights, config_local):
     return weight_dict
 
 
-def modify_adapter(peft_model, adapter_name, modify_module_rank ={},layer_dict = [], lora_alpha = 16, lora_dropout = 0.05, init_lora_weights = True):
+def modify_adapter(peft_model, adapter_name, modify_module_rank=None, layer_dict=None,
+                   lora_alpha=16, lora_dropout=0.05, init_lora_weights=True):
+    """
+    Update LoRA ranks for modules whose names contain keys in ``modify_module_rank``.
+    If ``layer_dict`` is None or empty, all layers are considered; otherwise only
+    layers whose name contains ``.{layer}.`` for some layer in ``layer_dict`` are updated.
+    """
+    if modify_module_rank is None:
+        modify_module_rank = {}
+    if layer_dict is None:
+        layer_dict = []
+
     for name, module in peft_model.named_modules():
-        if any(['.' + str(layer) + '.' in name for layer in layer_dict]):
-            for key, r in modify_module_rank.items():
-                if lora_alpha == 0:
-                    alpha = r
-                else:
-                    alpha = lora_alpha
-                if key in name and isinstance(module, peft.tuners.lora.Linear):
-                    module.update_layer(adapter_name, r, alpha, lora_dropout, init_lora_weights)
-                if key in name and isinstance(module, peft.tuners.lora.Linear8bitLt):
-                    module.update_layer(adapter_name, r, alpha, lora_dropout, init_lora_weights)
+        # If layer_dict is empty, match all layers; otherwise restrict to the given list.
+        if layer_dict and not any(f".{layer}." in name for layer in layer_dict):
+            continue
+        for key, r in modify_module_rank.items():
+            if lora_alpha == 0:
+                alpha = r
+            else:
+                alpha = lora_alpha
+            if key in name and isinstance(module, peft.tuners.lora.Linear):
+                module.update_layer(adapter_name, r, alpha, lora_dropout, init_lora_weights)
+            if key in name and isinstance(module, peft.tuners.lora.Linear8bitLt):
+                module.update_layer(adapter_name, r, alpha, lora_dropout, init_lora_weights)
 
 
 # fed_utils/adaptive_peft.py (append)

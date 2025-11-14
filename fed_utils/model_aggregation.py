@@ -180,8 +180,12 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             print(f"DEBUG: 尝试访问的 key: {layer_key}")
             print(f"DEBUG: layer_specs 中所有可用的 keys: {list(layer_specs.keys())}")
             print("="*50)
-            spec = layer_specs[layer_key]
-            d_out, d_in = spec["d_out"], spec["d_in"]
+            if layer_specs is not None and layer_key in layer_specs:
+                spec = layer_specs[layer_key]
+                d_out, d_in = spec["d_out"], spec["d_in"]
+            else:
+                d_out = int(usv["U"].shape[0])
+                d_in = int(usv["Vh"].shape[1])
             sigma = usv["sigma"]
             layers[layer_key] = {"sigma": sigma, "d_out":d_out, "d_in":d_in}
             bytes_per_col[layer_key] = int((d_out + d_in) * bytes_down_main)

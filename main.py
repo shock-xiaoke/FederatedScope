@@ -341,7 +341,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 local_weight = load_weight_SLoRA(global_params, model)
                 _ = model.load_state_dict(local_weight, strict=False)
 
-            if epoch > 0:
+            if epoch > 0 and args.aggregation != 'fedhera':
                 local_client_load_weight(args, model, epoch, global_params=global_params)
 
             client = GeneralClient(client_id, model, tokenizer, prompter, data_path, output_dir, cache_dir=args.cache_dir,
@@ -522,7 +522,34 @@ def main():
         task_type="CAUSAL_LM",
     )
     if args.baseline != 'slora':
-        model = get_peft_model(model, config, adapter_name = 'local')
+        model = get_peft_model(model, config, adapter_name='local')
+
+    # Rebuild layer_specs for Fed-Hera after LoRA modules are attached
+    if args.aggregation == 'fedhera':
+        layer_specs = {}
+        for name, param in model.named_parameters():
+            if "lora_A" in name or "lora_B" in name:
+                base_key = '.'.join(name.split('.')[:-3]) + '.lora'
+                if base_key not in layer_specs:
+                    if "lora_A" in name:
+                        _, d_in = param.shape
+                        layer_specs[base_key] = {"d_out": None, "d_in": int(d_in)}
+                    else:
+                        d_out, _ = param.shape
+                        if base_key not in layer_specs:
+                            layer_specs[base_key] = {"d_out": int(d_out), "d_in": None}
+                        else:
+                            layer_specs[base_key]["d_out"] = int(d_out)
+        for k, v in layer_specs.items():
+            if v["d_out"] is None or v["d_in"] is None:
+                for name, p in model.named_parameters():
+                    if k in name:
+                        if v["d_out"] is None and "lora_B" in name:
+                            v["d_out"] = int(p.shape[0])
+                        if v["d_in"] is None and "lora_A" in name:
+                            v["d_in"] = int(p.shape[1])
+        FL_training.layer_specs = layer_specs
+
     # world_size = int(os.environ.get("WORLD_SIZE", 1))
     # ddp = world_size != 1
     # if not ddp and torch.cuda.device_count() > 1:
