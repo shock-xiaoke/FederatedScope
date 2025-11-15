@@ -95,10 +95,6 @@ def read_options():
                         help='LoRA alpha')
     parser.add_argument('--lora_dropout', default=0.05, type=float,
                         help='LoRA dropout')
-    # parser.add_argument('--lora_target_modules', default=['q_proj', 'v_proj', 'k_proj', 'o_proj',
-    #                                                       'gate_proj', 'down_proj', 'up_proj'
-    #                                                       ], type=list,
-    #                     help='lora_target_modules')
     parser.add_argument('--lora_target_modules', default=['q_proj', 'v_proj'], type=list,
                         help='lora_target_modules')
 
@@ -113,15 +109,97 @@ def model_and_tokenizer(global_model, device_map='auto'):
     #     device_map=device_map,
     #     trust_remote_code=True,
     # )
-    model = AutoModelForCausalLM.from_pretrained(global_model,device_map = device_map,
-                                                trust_remote_code = True,torch_dtype = torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(
+        global_model,
+        device_map=device_map,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+    )
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
     tokenizer = AutoTokenizer.from_pretrained(global_model, trust_remote_code=True)
+    model_type = getattr(model.config, "model_type", "").lower()
     if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = 0
+        # For GPT-2-style models, padding with EOS is more stable.
+        if model_type in ["gpt2"]:
+            if tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            elif tokenizer.bos_token is not None:
+                tokenizer.pad_token = tokenizer.bos_token
+            else:
+                tokenizer.pad_token_id = 0
+        else:
+            tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
     return model, tokenizer
+
+
+def resolve_lora_targets_and_config_types(model, user_target_modules=None):
+    """
+    Choose sensible default LoRA target modules and heterogeneity configs
+    based on the underlying model architecture.
+    """
+    model_type = getattr(model.config, "model_type", "").lower()
+
+    # If the user explicitly provided a non-default list, respect it.
+    if user_target_modules and user_target_modules != ['q_proj', 'v_proj']:
+        target_modules = user_target_modules
+    else:
+        if model_type in ["llama", "mistral", "gemma"]:
+            # LLaMA/Mistral/Gemma use the same projection names.
+            target_modules = [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "down_proj",
+                "up_proj",
+            ]
+        elif model_type in ["gpt2"]:
+            # GPT-2 blocks: attn.c_attn / attn.c_proj / mlp.c_fc / mlp.c_proj
+            target_modules = ["c_attn", "c_proj", "c_fc"]
+        else:
+            # Fallback to the original default.
+            target_modules = ['q_proj', 'v_proj']
+
+    # Heterogeneous PEFT type presets.
+    small_r = 8
+    medium_r = 30
+    large_r = 200
+
+    if model_type in ["llama", "mistral", "gemma"] and set(
+        ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
+    ).issubset(set(target_modules)):
+        # Preserve original rank patterns for LLaMA-style models.
+        config_types = {
+            'Type_0': {
+                'q_proj': small_r, 'v_proj': small_r, 'k_proj': small_r, 'o_proj': small_r,
+                'gate_proj': small_r, 'down_proj': small_r, 'up_proj': small_r,
+            },
+            'Type_1': {
+                'q_proj': large_r, 'v_proj': large_r, 'k_proj': large_r, 'o_proj': large_r,
+                'gate_proj': large_r, 'down_proj': large_r, 'up_proj': large_r,
+            },
+            'Type_2': {
+                'q_proj': medium_r, 'v_proj': medium_r, 'k_proj': medium_r, 'o_proj': medium_r,
+                'gate_proj': large_r, 'down_proj': large_r, 'up_proj': large_r,
+            },
+            'Type_3': {
+                'q_proj': medium_r, 'v_proj': medium_r, 'k_proj': medium_r, 'o_proj': medium_r,
+                'gate_proj': medium_r, 'down_proj': medium_r, 'up_proj': medium_r,
+            },
+        }
+    else:
+        # Generic patterns for other architectures (including GPT-2).
+        config_types = {
+            'Type_0': {m: small_r for m in target_modules},
+            'Type_1': {m: large_r for m in target_modules},
+            'Type_2': {m: medium_r for m in target_modules},
+            'Type_3': {m: medium_r for m in target_modules},
+        }
+
+    return target_modules, config_types
 
 
 def get_peft(config_types, num_clients, strategy=None):
@@ -483,20 +561,16 @@ def main():
     else:
         output_dir = os.path.join(args.session_name, args.aggregation)
 
-    # set up the global model & toknizer
+    # set up the global model & tokenizer
     model, tokenizer = model_and_tokenizer(global_model=args.global_model, device_map='auto')
 
     prompter = Prompter(args.prompt_template_name)
 
-    
-    config_types = {
-        'Type_0': {'q_proj': 8, 'v_proj': 8, 'k_proj': 8, 'o_proj': 8, 'gate_proj': 8, 'down_proj': 8, 'up_proj': 8},
-        'Type_1': {'q_proj': 200, 'v_proj': 200, 'k_proj': 200, 'o_proj': 200, 'gate_proj': 200, 'down_proj': 200,
-                   'up_proj': 200},
-        'Type_2': {'q_proj': 30, 'v_proj': 30, 'k_proj': 30, 'o_proj': 30, 'gate_proj': 200, 'down_proj': 200,
-                   'up_proj': 200},
-        'Type_3': {'q_proj': 30, 'v_proj': 30, 'k_proj': 30, 'o_proj': 30, 'gate_proj': 30, 'down_proj': 30,
-                   'up_proj': 30}, }
+    # Choose model-appropriate LoRA target modules and heterogeneity configs.
+    lora_target_modules, config_types = resolve_lora_targets_and_config_types(
+        model,
+        user_target_modules=args.lora_target_modules,
+    )
     config_local = get_peft(config_types, num_clients=args.num_clients, strategy=args.aggregation)
 
     logging.info(config_local)
@@ -504,7 +578,7 @@ def main():
     config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
-        target_modules=args.lora_target_modules,
+        target_modules=lora_target_modules,
         lora_dropout=args.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",

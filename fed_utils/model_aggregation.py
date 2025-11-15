@@ -176,10 +176,6 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
         c_mem_per_col = {}
         c_time_per_col = {}
         for layer_key, usv in per_layer_USV.items():
-            print("="*50)
-            print(f"DEBUG: 尝试访问的 key: {layer_key}")
-            print(f"DEBUG: layer_specs 中所有可用的 keys: {list(layer_specs.keys())}")
-            print("="*50)
             if layer_specs is not None and layer_key in layer_specs:
                 spec = layer_specs[layer_key]
                 d_out, d_in = spec["d_out"], spec["d_in"]

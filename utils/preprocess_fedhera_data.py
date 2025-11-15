@@ -1,0 +1,295 @@
+import argparse
+import json
+import os
+from typing import List, Dict, Any, Tuple
+
+import numpy as np
+from datasets import load_dataset, Dataset
+
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _to_fedhera_example_mathqa(example: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a MetaMathQA-style record to (instruction, input, output)."""
+    question = (
+        example.get("query")
+        or example.get("question")
+        or example.get("problem")
+        or example.get("input")
+        or ""
+    )
+    answer = (
+        example.get("response")
+        or example.get("solution")
+        or example.get("answer")
+        or example.get("output")
+        or ""
+    )
+    instruction = (
+        "Solve the following math problem and provide the final answer. "
+        "Show intermediate reasoning if it helps."
+    )
+    return {
+        "instruction": instruction,
+        "input": question,
+        "output": answer,
+        "category": "MetaMathQA",
+    }
+
+
+def _to_fedhera_example_commonsense(example: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a commonsense QA-style record to (instruction, input, output)."""
+    context = (
+        example.get("context")
+        or example.get("passage")
+        or example.get("story")
+        or example.get("sentence")
+        or ""
+    )
+    question = (
+        example.get("question")
+        or example.get("query")
+        or example.get("input")
+        or ""
+    )
+    # Label / answer field names vary widely across commonsense datasets.
+    answer = (
+        example.get("answer")
+        or example.get("label")
+        or example.get("target")
+        or example.get("output")
+        or ""
+    )
+
+    if context:
+        inp = f"Context: {context}\nQuestion: {question}"
+    else:
+        inp = question
+
+    instruction = (
+        "Answer the following commonsense reasoning question based on the given context."
+    )
+    return {
+        "instruction": instruction,
+        "input": inp,
+        "output": answer,
+        "category": "Commonsense",
+    }
+
+
+def _to_fedhera_example_e2e(example: Dict[str, Any]) -> Dict[str, Any]:
+    """Map an E2E NLG-style record to (instruction, input, output)."""
+    mr = (
+        example.get("meaning_representation")
+        or example.get("mr")
+        or example.get("input")
+        or ""
+    )
+    # Different variants store references under different keys.
+    ref = (
+        example.get("human_reference")
+        or example.get("reference")
+        or example.get("ref")
+        or example.get("output")
+        or ""
+    )
+
+    instruction = (
+        "Generate a fluent natural language description for the given meaning representation."
+    )
+    return {
+        "instruction": instruction,
+        "input": mr,
+        "output": ref,
+        "category": "E2E_NLG",
+    }
+
+
+def _split_across_clients(
+    records: List[Dict[str, Any]],
+    num_clients: int,
+    train_ratio: float = 0.8,
+    eval_ratio: float = 0.1,
+    seed: int = 42,
+) -> Dict[int, Dict[str, List[Dict[str, Any]]]]:
+    """Shuffle and split records into per-client train/eval/test sets."""
+    rng = np.random.default_rng(seed)
+    indices = np.arange(len(records))
+    rng.shuffle(indices)
+
+    per_client = len(records) // num_clients
+    remainder = len(records) % num_clients
+
+    out: Dict[int, Dict[str, List[Dict[str, Any]]]] = {}
+    cursor = 0
+    for cid in range(num_clients):
+        size = per_client + (1 if cid < remainder else 0)
+        client_idx = indices[cursor: cursor + size]
+        cursor += size
+        client_records = [records[i] for i in client_idx]
+
+        n = len(client_records)
+        n_train = int(n * train_ratio)
+        n_eval = int(n * eval_ratio)
+        n_test = n - n_train - n_eval
+
+        train = client_records[:n_train]
+        eval_ = client_records[n_train:n_train + n_eval]
+        test = client_records[n_train + n_eval:]
+
+        out[cid] = {
+            "train": train,
+            "eval": eval_,
+            "test": test,
+        }
+    return out
+
+
+def _save_client_splits(
+    splits: Dict[int, Dict[str, List[Dict[str, Any]]]],
+    output_root: str,
+    num_clients: int,
+) -> None:
+    base_dir = os.path.join(output_root, str(num_clients))
+    _ensure_dir(base_dir)
+
+    for cid, parts in splits.items():
+        train_path = os.path.join(base_dir, f"local_training_{cid}.json")
+        eval_path = os.path.join(base_dir, f"local_eval_{cid}.json")
+        test_path = os.path.join(base_dir, f"local_test_{cid}.json")
+
+        with open(train_path, "w", encoding="utf-8") as f:
+            json.dump(parts["train"], f, ensure_ascii=False)
+        with open(eval_path, "w", encoding="utf-8") as f:
+            json.dump(parts["eval"], f, ensure_ascii=False)
+        with open(test_path, "w", encoding="utf-8") as f:
+            json.dump(parts["test"], f, ensure_ascii=False)
+
+
+def _load_source_dataset(task: str, hf_dataset: str | None, data_files: str | None, split: str) -> Dataset:
+    """
+    Load a source dataset either from Hugging Face Hub (hf_dataset)
+    or from local JSON/JSONL/CSV files (data_files).
+    """
+    if hf_dataset:
+        ds = load_dataset(hf_dataset, split=split)
+    else:
+        if data_files is None:
+            raise ValueError("Either --hf_dataset or --data_files must be provided.")
+        # Let datasets infer the format from extension.
+        if data_files.endswith(".csv"):
+            ds = load_dataset("csv", data_files=data_files, split="train")
+        else:
+            ds = load_dataset("json", data_files=data_files, split="train")
+    return ds
+
+
+def preprocess_task(
+    task: str,
+    hf_dataset: str | None,
+    data_files: str | None,
+    split: str,
+    output_root: str,
+    num_clients: int,
+    max_examples: int | None,
+    seed: int = 42,
+) -> None:
+    ds = _load_source_dataset(task, hf_dataset, data_files, split)
+
+    if max_examples is not None:
+        ds = ds.shuffle(seed=seed).select(range(min(max_examples, len(ds))))
+
+    records: List[Dict[str, Any]] = []
+    if task == "metamathqa":
+        mapper = _to_fedhera_example_mathqa
+    elif task == "commonsense":
+        mapper = _to_fedhera_example_commonsense
+    elif task == "e2e_nlg":
+        mapper = _to_fedhera_example_e2e
+    else:
+        raise ValueError(f"Unsupported task: {task}")
+
+    for ex in ds:
+        rec = mapper(ex)
+        if rec["instruction"] and rec["output"]:
+            records.append(rec)
+
+    splits = _split_across_clients(records, num_clients=num_clients, seed=seed)
+    _save_client_splits(splits, output_root=output_root, num_clients=num_clients)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Preprocess datasets into Fed-Hera JSON format for multiple clients."
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        required=True,
+        choices=["metamathqa", "commonsense", "e2e_nlg"],
+        help="Which task to preprocess.",
+    )
+    parser.add_argument(
+        "--hf_dataset",
+        type=str,
+        default=None,
+        help="Optional Hugging Face dataset name (e.g., meta-math/MetaMathQA).",
+    )
+    parser.add_argument(
+        "--data_files",
+        type=str,
+        default=None,
+        help="Optional local data files path (JSON/JSONL/CSV) if not using hf_dataset.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        help="Dataset split to use when loading from Hugging Face.",
+    )
+    parser.add_argument(
+        "--output_root",
+        type=str,
+        required=True,
+        help="Base output directory for this task, e.g., ./data/arithmetic, ./data/commonsense, ./data/nlg.",
+    )
+    parser.add_argument(
+        "--num_clients",
+        type=int,
+        default=20,
+        help="Number of federated clients to simulate.",
+    )
+    parser.add_argument(
+        "--max_examples",
+        type=int,
+        default=None,
+        help="Maximum number of examples to use (e.g., 10000 for MetaMathQA).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for shuffling and client splitting.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    preprocess_task(
+        task=args.task,
+        hf_dataset=args.hf_dataset,
+        data_files=args.data_files,
+        split=args.split,
+        output_root=args.output_root,
+        num_clients=args.num_clients,
+        max_examples=args.max_examples,
+        seed=args.seed,
+    )
+
+
+if __name__ == "__main__":
+    main()
+
