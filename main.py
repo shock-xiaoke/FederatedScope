@@ -534,7 +534,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                                                            client_budgets = FL_training.client_budgets,
                                   layer_specs = FL_training.layer_specs,
                                   quant_scheme = ("bfloat16", "nf4"),
-                                  use_gpu_svd = False,
+                                  use_gpu_svd = True,
                                   basis_update_every = args.basis_update_every)
             # adapter_model.bin 可存聚合Wg，便于可视化/对照
                       torch.save(_, os.path.join(output_dir, "adapter_model.bin"))
