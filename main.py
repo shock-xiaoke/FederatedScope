@@ -137,7 +137,14 @@ def model_and_tokenizer(global_model, device_map='auto'):
     )
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
-    tokenizer = AutoTokenizer.from_pretrained(global_model, trust_remote_code=True)
+    # For some newer models (e.g., Mistral) and older `tokenizers` versions,
+    # the fast tokenizer JSON can be incompatible. Force the slow tokenizer
+    # to avoid Rust `tokenizers` version issues.
+    tokenizer = AutoTokenizer.from_pretrained(
+        global_model,
+        trust_remote_code=True,
+        use_fast=False,
+    )
     model_type = getattr(model.config, "model_type", "").lower()
     if tokenizer.pad_token_id is None:
         # For GPT-2-style models, padding with EOS is more stable.
