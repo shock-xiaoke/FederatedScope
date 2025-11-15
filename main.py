@@ -1,6 +1,16 @@
 from tqdm import tqdm
 from scipy.stats import norm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+try:
+    # For older transformers versions, register newer model types on the fly.
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    try:
+        from transformers.models.llama.configuration_llama import LlamaConfig
+    except Exception:
+        LlamaConfig = None
+except Exception:
+    CONFIG_MAPPING = None
+    LlamaConfig = None
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -109,6 +119,16 @@ def model_and_tokenizer(global_model, device_map='auto'):
     #     device_map=device_map,
     #     trust_remote_code=True,
     # )
+    if CONFIG_MAPPING is not None and LlamaConfig is not None:
+        model_id_lower = str(global_model).lower()
+        if "mistral" in model_id_lower and "mistral" not in CONFIG_MAPPING:
+            try:
+                if hasattr(CONFIG_MAPPING, "register"):
+                    CONFIG_MAPPING.register("mistral", LlamaConfig)
+                else:
+                    CONFIG_MAPPING._extra_content["mistral"] = LlamaConfig
+            except Exception:
+                pass
     model = AutoModelForCausalLM.from_pretrained(
         global_model,
         device_map=device_map,
