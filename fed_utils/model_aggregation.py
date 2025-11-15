@@ -155,7 +155,10 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             "sigma": S.detach().cpu().numpy()
         }
         del U, S, Vh, W
+        del aggregated[layer_key]
         torch.cuda.empty_cache()
+    import gc
+    gc.collect()
 
     # 4) 为每客户端做 rank 分配并写入 server_push 包
     quant_main, quant_res = quant_scheme

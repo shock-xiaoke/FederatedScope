@@ -34,6 +34,19 @@ import logging
 import argparse
 os.environ["WANDB_MODE"]="disabled"
 
+import json
+
+def parse_lora_target_modules(s):
+    # Accept JSON list or comma-separated string
+    try:
+        v = json.loads(s)
+        if isinstance(v, list):
+            return v
+    except Exception:
+        pass
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
 
 def read_options():
     parser = argparse.ArgumentParser()
@@ -51,8 +64,6 @@ def read_options():
                         help='random seed')
 
     ## FL parameters
-    # parser.add_argument('--aggregation', default='homo', type=str,
-    #                     help='aggregation method', choices=['homo','random','heavy_tail','heavy_tail_strong','normal'])
     parser.add_argument('--aggregation', default='homo', type=str, help = 'aggregation method',
                         choices = ['homo', 'random', 'heavy_tail', 'heavy_tail_strong', 'normal', 'fedhera'])
     parser.add_argument('--hetero_mode', default='heavy_tail', type=str,
@@ -74,6 +85,7 @@ def read_options():
                         help='Early stop patience.')
     parser.add_argument('--resume_epoch', default=None, type=int,
                         help='continue training from an existing experiment, specifying which comm round to resume')
+    
     ## Local training parameters
     parser.add_argument('--local_batch_size', default=4, type=int,
                         help='local_batch_size')
@@ -96,8 +108,6 @@ def read_options():
     parser.add_argument('--prompt_template_name', default='alpaca', type=str,
                         help='template to generate prompt')
 
-
-
     ## LoRA Parameters
     parser.add_argument('--lora_r', default=8, type=int,
                         help='LoRA rank')
@@ -105,8 +115,11 @@ def read_options():
                         help='LoRA alpha')
     parser.add_argument('--lora_dropout', default=0.05, type=float,
                         help='LoRA dropout')
-    parser.add_argument('--lora_target_modules', default=['q_proj', 'v_proj'], type=list,
-                        help='lora_target_modules')
+    parser.add_argument('--lora_target_modules',
+                        default=['q_proj', 'v_proj'],
+                        type=parse_lora_target_modules,
+                        help='lora_target_modules (JSON list or comma-separated)',
+                        )
 
     args = parser.parse_args()
     return args
@@ -422,6 +435,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             train_path = data_path + '/local_training_' + str(client_id) + '.json'
             train_data = load_dataset("json", data_files=train_path, cache_dir=args.cache_dir)
             local_dataset_len_dict[client_id] = len(train_data['train'])
+            del train_data
             total_data_num += local_dataset_len_dict[client_id]
 
             # Fed-Hera: 尝试加载 server_push 包（若本轮生成）
@@ -527,17 +541,18 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
         elif args.aggregation == 'fedhera':
             # Fed-Hera: 生成每客户端下发包 + 返回全局Wg（可选保存做日志）
-                      _ = FedHera(selected_clients_set,
-                                                           output_dir,
-                                                           local_dataset_len_dict,
-                                                           epoch,
-                                                           client_budgets = FL_training.client_budgets,
-                                  layer_specs = FL_training.layer_specs,
-                                  quant_scheme = ("bfloat16", "nf4"),
-                                  use_gpu_svd = True,
-                                  basis_update_every = args.basis_update_every)
+            FedHera(selected_clients_set,
+                    output_dir,
+                    local_dataset_len_dict,
+                    epoch,
+                    client_budgets = FL_training.client_budgets,
+                    layer_specs = FL_training.layer_specs,
+                    quant_scheme = ("bfloat16", "nf4"),
+                    use_gpu_svd = True,
+                    basis_update_every = args.basis_update_every)
             # adapter_model.bin 可存聚合Wg，便于可视化/对照
-                      torch.save(_, os.path.join(output_dir, "adapter_model.bin"))
+            # torch.save(_, os.path.join(output_dir, "adapter_model.bin"))
+            
         else:
             global_params = FlexLoRA(selected_clients_set,
                                    output_dir,
@@ -560,6 +575,10 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             if current_count > patience:
                 logging.info(f"Best round is {best_round} with test_rouge_L {best_rouge_L}")
                 return
+        local_dataset_len_dict = {}
+        import gc
+        gc.collect()
+
 
 def main():
     args = read_options()
