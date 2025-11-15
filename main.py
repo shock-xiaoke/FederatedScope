@@ -107,34 +107,16 @@ def read_options():
 
 
 def model_and_tokenizer(global_model, device_map='auto'):
-    """
-    Load model and tokenizer and place the model on GPU if available.
-    Prefer bf16 on Ampere+ GPUs, otherwise fall back to fp16/cpu fp32.
-    """
-    if torch.cuda.is_available():
-        major, _ = torch.cuda.get_device_capability()
-        use_bf16 = major >= 8  # Ampere or newer
-        if use_bf16:
-            torch_dtype = torch.bfloat16
-        else:
-            torch_dtype = torch.float16
-        device = 'cuda'
-    else:
-        use_bf16 = False
-        torch_dtype = torch.float32
-        device = 'cpu'
-
-    # Do not rely on Accelerate's device_map here; move explicitly.
-    model = AutoModelForCausalLM.from_pretrained(
-        global_model,
-        trust_remote_code=True,
-        torch_dtype=torch_dtype,
-        device_map=None,
-    )
-    model.to(device)
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     global_model,
+    #     torch_dtype=torch.bfloat16,
+    #     device_map=device_map,
+    #     trust_remote_code=True,
+    # )
+    model = AutoModelForCausalLM.from_pretrained(global_model,device_map = device_map,
+                                                trust_remote_code = True,torch_dtype = torch.bfloat16)
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
-
     tokenizer = AutoTokenizer.from_pretrained(global_model, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = 0
@@ -146,8 +128,8 @@ def get_peft(config_types, num_clients, strategy=None):
     """
     get each client's unique LoRA configuration based on the "aggregation" parameter
     """
-    if strategy == 'homo':
-        return
+    if strategy in ['homo', 'fedhera']:
+        return {'alpha': 16, 'lora_dropout': 0.05}
     else:
         # random select lora type for clients
         if strategy == 'random':
@@ -155,11 +137,6 @@ def get_peft(config_types, num_clients, strategy=None):
             for i in range(num_clients):
                 type = 'Type_' + str(np.random.randint(0, 4))
                 config_local['Client_' + str(i)] = config_types[type]
-        elif strategy == 'fedhera':
-            config_local = {'alpha': 16, 'lora_dropout': 0.05}
-            for i in range(num_clients):
-                config_local[f'Client_{i}'] = {}
-            return config_local
         elif strategy == 'heavy_tail':
             config_local = {'alpha':16, 'lora_dropout':0.05}
             for i in range(num_clients):
@@ -224,6 +201,8 @@ def local_client_modify_layer(args, epoch, config_local, model, client_id):
     """
     Modify local client's LoRA layers based on local config
     """
+    if args.aggregation == 'fedhera':
+        return
     if args.aggregation != 'homo':
         if args.baseline == 'slora' and epoch >= args.R_1:
             local_lora_config = config_local['Client_' + str(client_id)]
@@ -344,16 +323,42 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             from fed_utils.adaptive_peft import load_weight_fedhera_if_exists, apply_lora_prefix_mask
             prev_epoch = max(0, epoch - 1)
             pkg, meta = load_weight_fedhera_if_exists(output_dir, client_id, prev_epoch)
-            if pkg is not None:
-                # Resize LoRA ranks per layer to r_tot before loading server weights
-                per_layer_r_tot = {k: int(v.get("r_tot", 0)) for k, v in meta.items() if not v.get("skip", False)}
-                if len(per_layer_r_tot) > 0:
-                    modify_adapter(model, 'local', modify_module_rank=per_layer_r_tot,
-                                   lora_alpha=16, lora_dropout=0.05, init_lora_weights=False)
+            hera_hooks = None
+            if pkg is not None and meta is not None:
+                # 1) 先把每个 base_key (xxx.q_proj.lora) 映射成模块名 (xxx.q_proj)，用于改 LoRA rank
+                per_layer_r_tot = {}
+                for base_key, info in meta.items():
+                    if info.get("skip", False):
+                        continue
+                    rt = int(info.get("r_tot", 0))
+                    if rt <= 0:
+                        continue
+                    # base_key 形如 "...q_proj.lora" -> 模块名是去掉最后一个 .lora
+                    module_key = base_key.rsplit(".", 1)[0]  # "...q_proj"
+                    per_layer_r_tot[module_key] = rt
+
+                if per_layer_r_tot:
+                    # 2) 真的把对应 LoRA 模块的 rank 调整到 r_tot
+                    modify_adapter(
+                        model,
+                        'local',
+                        modify_module_rank=per_layer_r_tot,
+                        lora_alpha=16,
+                        lora_dropout=0.05,
+                        init_lora_weights=False,
+                    )
+
+                # 3) 再加载服务器下发的 A/B 权重，此时形状已经匹配
                 _ = model.load_state_dict(pkg, strict=False)
-                # 根据 meta 设置每层 r_main 的前缀门控
-                per_layer_r_main = {k: int(v.get("r_main", 0)) for k, v in meta.items() if not v.get("skip", False)}
+
+                # 4) 设置前缀门控，只让前 r_main 列/行参与训练
+                per_layer_r_main = {
+                    k: int(v.get("r_main", 0))
+                    for k, v in meta.items()
+                    if not v.get("skip", False)
+                }
                 hera_hooks = apply_lora_prefix_mask(model, per_layer_r_main)
+
 
             if args.baseline == 'slora' and args.R_1 == epoch:
                 local_weight = load_weight_SLoRA(global_params, model)
@@ -483,42 +488,7 @@ def main():
 
     prompter = Prompter(args.prompt_template_name)
 
-    # 对每层记录 (d_out, d_in)，提供给 Fed-Hera 的分配器做字节估算
-    layer_specs = {}
-
-    for name, param in model.named_parameters():
-
-        if "lora_A" in name or "lora_B" in name:
-            base_key = '.'.join(name.split('.')[:-3]) + '.lora'
-            if base_key not in layer_specs:
-                if "lora_A" in name:
-                    r, d_in = param.shape
-                    # 对应 B 的形状稍后由伙伴参数获取
-                    layer_specs[base_key] = {"d_out": None, "d_in": int(d_in)}
-                else:
-                    d_out, r = param.shape
-                    if base_key not in layer_specs:
-                        layer_specs[base_key] = {"d_out": int(d_out), "d_in": None}
-                    else:
-                        layer_specs[base_key]["d_out"] = int(d_out)
-    # 补全空值
-
-    for k, v in layer_specs.items():
-        if v["d_out"] is None or v["d_in"] is None:
-            # 粗略补全：如果某层只出现一侧，取另一侧出现的维度
-            for name, p in model.named_parameters():
-                if k in name:
-                    if v["d_out"] is None and "lora_B" in name:
-                        v["d_out"] = int(p.shape[0])
-                    if v["d_in"] is None and "lora_A" in name:
-                        v["d_in"] = int(p.shape[1])
-
-    # 生成 Fed-Hera 的 per-client 预算
-    client_budgets = build_fedhera_budgets(args.num_clients, args.hetero_mode, seed=args.seed)
-    # 传入训练循环（避免函数签名大改）
-    FL_training.layer_specs = layer_specs
-    FL_training.client_budgets = client_budgets
-
+    
     config_types = {
         'Type_0': {'q_proj': 8, 'v_proj': 8, 'k_proj': 8, 'o_proj': 8, 'gate_proj': 8, 'down_proj': 8, 'up_proj': 8},
         'Type_1': {'q_proj': 200, 'v_proj': 200, 'k_proj': 200, 'o_proj': 200, 'gate_proj': 200, 'down_proj': 200,
@@ -540,33 +510,44 @@ def main():
         task_type="CAUSAL_LM",
     )
     if args.baseline != 'slora':
-        model = get_peft_model(model, config, adapter_name='local')
-
-    # Rebuild layer_specs for Fed-Hera after LoRA modules are attached
+        model = get_peft_model(model, config, adapter_name = 'local')
+    
     if args.aggregation == 'fedhera':
+        # 对每层记录 (d_out, d_in)，提供给 Fed-Hera 的分配器做字节估算
         layer_specs = {}
+
         for name, param in model.named_parameters():
+
             if "lora_A" in name or "lora_B" in name:
                 base_key = '.'.join(name.split('.')[:-3]) + '.lora'
                 if base_key not in layer_specs:
                     if "lora_A" in name:
-                        _, d_in = param.shape
+                        r, d_in = param.shape
+                        # 对应 B 的形状稍后由伙伴参数获取
                         layer_specs[base_key] = {"d_out": None, "d_in": int(d_in)}
                     else:
-                        d_out, _ = param.shape
+                        d_out, r = param.shape
                         if base_key not in layer_specs:
                             layer_specs[base_key] = {"d_out": int(d_out), "d_in": None}
                         else:
                             layer_specs[base_key]["d_out"] = int(d_out)
+        # 补全空值
+
         for k, v in layer_specs.items():
             if v["d_out"] is None or v["d_in"] is None:
+                # 粗略补全：如果某层只出现一侧，取另一侧出现的维度
                 for name, p in model.named_parameters():
                     if k in name:
                         if v["d_out"] is None and "lora_B" in name:
                             v["d_out"] = int(p.shape[0])
                         if v["d_in"] is None and "lora_A" in name:
                             v["d_in"] = int(p.shape[1])
+
+        # 生成 Fed-Hera 的 per-client 预算
+        client_budgets = build_fedhera_budgets(args.num_clients, args.hetero_mode, seed=args.seed)
+        # 传入训练循环（避免函数签名大改）
         FL_training.layer_specs = layer_specs
+        FL_training.client_budgets = client_budgets
 
     # world_size = int(os.environ.get("WORLD_SIZE", 1))
     # ddp = world_size != 1
