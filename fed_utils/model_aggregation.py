@@ -143,20 +143,22 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
 
     # 3) 对每层做 SVD，准备每层奇异值谱与 U,S,V
     per_layer_USV = {}
-    for layer_key, Wg in aggregated.items():
+    for layer_key in list(aggregated.keys()):
+        Wg = aggregated[layer_key]
         device = "cuda" if (use_gpu_svd and torch.cuda.is_available()) else "cpu"
-        W = Wg.to(device=device, dtype=torch.float32)  # 用 fp32 做 SVD 更稳定
+        W = Wg.to(device=device, dtype=torch.float32)
         U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-        # 为节省下行，先回 CPU
         per_layer_USV[layer_key] = {
             "U": U.to("cpu"),
             "S": S.to("cpu"),
             "Vh": Vh.to("cpu"),
-            "sigma": S.detach().cpu().numpy()
+            "sigma": S.detach().cpu().numpy(),
         }
-        del U, S, Vh, W
-        del aggregated[layer_key]
+
+        # free this layer’s big matrices
+        del Wg, W, U, S, Vh
         torch.cuda.empty_cache()
+
     import gc
     gc.collect()
 
