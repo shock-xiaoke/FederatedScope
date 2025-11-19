@@ -3,7 +3,30 @@ import torch
 import os
 from torch.nn.functional import normalize
 import gc
+import logging
 from tqdm import tqdm
+
+
+# Simple global traffic counters to let the training loop
+# summarise total communication and compute volume.
+TRAFFIC_STATS = {
+    "FlexLoRA": {"transmit_MB": 0.0, "compute_MB": 0.0},
+    "FedHera": {"transmit_MB": 0.0, "compute_MB": 0.0},
+}
+
+
+def reset_traffic_stats():
+    for method in TRAFFIC_STATS:
+        TRAFFIC_STATS[method]["transmit_MB"] = 0.0
+        TRAFFIC_STATS[method]["compute_MB"] = 0.0
+
+
+def get_traffic_stats():
+    # Return a shallow copy so callers cannot mutate internals.
+    return {
+        name: stats.copy()
+        for name, stats in TRAFFIC_STATS.items()
+    }
 
 
 def FedAvg(selected_clients_set, output_dir, local_dataset_len_dict, epoch):
@@ -71,31 +94,64 @@ def truncate(selected_clients_set, output_dir, local_dataset_len_dict, epoch, ha
     return weighted_single_weights
 
 def FlexLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch):
+    """
+    Aggregate heterogeneous LoRA adapters from clients.
+
+    In addition to the merged weights, this function also updates
+    global TRAFFIC_STATS with the communication/compute volume for
+    this round. In FlexLoRA, transmit and compute data are the same
+    because clients train on all transmitted ranks.
+    """
     weights_array = torch.tensor(
         [local_dataset_len_dict[client_id] for client_id in selected_clients_set], dtype=torch.float32
     )
     weights_array = torch.nn.functional.normalize(weights_array, p=1, dim=0)
     weighted_single_weights = {}
+
+    round_transmit_bytes = 0.0
+    round_compute_bytes = 0.0
+
     with torch.no_grad():
         for k, client_id in tqdm(enumerate(selected_clients_set)):
-            single_output_dir = os.path.join(output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin")
+            single_output_dir = os.path.join(
+                output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin"
+            )
             single_weights = torch.load(single_output_dir, map_location='cpu')
             for key in list(single_weights.keys()):
-                if 'local' in key and 'bias' not in key:
-                    if 'lora_A' in key:
-                        B_key = key.replace('lora_A', 'lora_B')
-                        rank = single_weights[B_key].shape[1]
-                        merge_rate = 16 / rank
-                        new_key = '.'.join(key.split('.')[:-3]) + '.lora'
-                        if new_key not in weighted_single_weights.keys():
-                            weighted_single_weights[new_key] = 0
-                        merged_weight = (single_weights[B_key] @ single_weights[key]) * merge_rate * weights_array[k]
-                        weighted_single_weights[new_key] += merged_weight
-                        del merged_weight
-                        torch.cuda.empty_cache()
+                if 'local' in key and 'bias' not in key and 'lora_A' in key:
+                    B_key = key.replace('lora_A', 'lora_B')
+                    rank = single_weights[B_key].shape[1]
+                    merge_rate = 16 / max(rank, 1)
+                    new_key = '.'.join(key.split('.')[:-3]) + '.lora'
+                    if new_key not in weighted_single_weights.keys():
+                        weighted_single_weights[new_key] = 0
+                    merged_weight = (single_weights[B_key] @ single_weights[key]) * merge_rate * weights_array[k]
+                    weighted_single_weights[new_key] += merged_weight
+
+                    # Track per-round communication/compute volume for this LoRA pair.
+                    d_in = single_weights[key].shape[1]
+                    d_out = single_weights[B_key].shape[0]
+                    elem_bytes = single_weights[key].element_size()
+                    bytes_this = (d_in + d_out) * rank * elem_bytes
+                    round_transmit_bytes += bytes_this
+                    round_compute_bytes += bytes_this  # same for FlexLoRA
+
+                    del merged_weight
+                    torch.cuda.empty_cache()
             del single_weights
             # gc.collect()
             torch.cuda.empty_cache()
+
+    MB = 1024.0 * 1024.0
+    TRAFFIC_STATS["FlexLoRA"]["transmit_MB"] += round_transmit_bytes / MB
+    TRAFFIC_STATS["FlexLoRA"]["compute_MB"] += round_compute_bytes / MB
+    logging.info(
+        "[FlexLoRA][epoch %d] transmit_MB=%.3f compute_MB=%.3f",
+        epoch,
+        round_transmit_bytes / MB,
+        round_compute_bytes / MB,
+    )
+
     torch.cuda.empty_cache()
     return weighted_single_weights
 
@@ -167,6 +223,9 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     BYTE_MAP = {"fp16":2, "bfloat16":2, "int8":1, "nf4":0.5, "int4":0.5}
     bytes_down_main = BYTE_MAP.get(quant_main, 2.0)
     bytes_down_res  = BYTE_MAP.get(quant_res, 0.5)
+    MB = 1024.0 * 1024.0
+    round_transmit_bytes = 0.0
+    round_compute_bytes = 0.0
     # 统一用 "每列字节" 估算：(d_out + d_in) * bytes
     # 下发时我们一次性给到 r_tot 列（包含 main+res），bytes 用更保守的主精度估。
     for client_id in selected_clients_set:

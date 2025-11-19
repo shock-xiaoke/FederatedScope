@@ -18,6 +18,7 @@ from peft import (
 )
 from fed_utils import FedAvg, client_selection, seed_torch, GeneralClient, FlexLoRA, \
     load_weight_local, distribute_weight_fast, modify_adapter, load_weight_SLoRA, FedHera
+from fed_utils.model_aggregation import reset_traffic_stats, get_traffic_stats, TRAFFIC_STATS
 
 import datasets
 from datasets import load_dataset
@@ -35,6 +36,84 @@ import argparse
 os.environ["WANDB_MODE"]="disabled"
 
 import json
+
+# Canonical LoRA ranks associated with client resource levels.
+# These are used both for heterogeneous FlexLoRA ranks and, via
+# Fed-Hera, for computing client resource budgets.
+RESOURCE_RANKS = {
+    "poor": 1,
+    "medium": 4,
+    "high": 16,
+}
+
+
+def build_fedhera_budgets_from_layers(num_clients, hetero_mode, layer_specs, seed=42):
+    """
+    Compute Fed-Hera client budgets based on LoRA computation.
+
+    The three resource tiers (poor/medium/high) are calibrated so
+    that they can roughly sustain LoRA ranks {1, 4, 16} across
+    all LoRA layers, assuming bfloat16 storage for the main adapter.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Aggregate per-column costs over LoRA layers.
+    bytes_per_elem_main = 2.0  # bfloat16 main adapter in Fed-Hera.
+    total_bytes_per_col = 0.0
+    total_mem_per_col = 0.0
+    total_time_per_col = 0.0
+    for spec in layer_specs.values():
+        d_out = int(spec["d_out"])
+        d_in = int(spec["d_in"])
+        total_bytes_per_col += (d_out + d_in) * bytes_per_elem_main
+        # Match the cost model used in allocate_r_main_for_client.
+        total_mem_per_col += (d_out + d_in) * 2.0 * 3.5
+        total_time_per_col += 1.0
+
+    MB = 1024.0 * 1024.0
+
+    def tier_for_rank(rank: int):
+        return {
+            "B_down_MB": total_bytes_per_col * rank / MB,
+            "VRAM_MB": total_mem_per_col * rank / MB,
+            "step_ms": total_time_per_col * rank,
+        }
+
+    poor_rank = RESOURCE_RANKS.get("poor", 1)
+    medium_rank = RESOURCE_RANKS.get("medium", 4)
+    high_rank = RESOURCE_RANKS.get("high", 16)
+
+    TIERS = {
+        "poor": tier_for_rank(poor_rank),
+        "medium": tier_for_rank(medium_rank),
+        "high": tier_for_rank(high_rank),
+    }
+
+    # Tier mixing across clients according to hetero_mode.
+    if hetero_mode == 'random':
+        probs = [1 / 3, 1 / 3, 1 / 3]
+    elif hetero_mode == 'normal':
+        probs = [0.25, 0.5, 0.25]
+    else:  # heavy_tail
+        probs = [0.6, 0.3, 0.1]
+    tier_names = ["poor", "medium", "high"]
+
+    client_budgets = {}
+    for i in range(num_clients):
+        tier = rng.choice(tier_names, p=probs)
+        base = TIERS[tier]
+        # Per-client randomisation within the chosen tier.
+        f_down = _sample_factor(hetero_mode, rng)
+        f_vram = _sample_factor(hetero_mode, rng)
+        f_step = _sample_factor(hetero_mode, rng)
+        client_budgets[i] = {
+            "tier": tier,
+            "B_down_MB": float(base["B_down_MB"] * f_down),
+            "VRAM_MB": float(base["VRAM_MB"] * f_vram),
+            "step_ms": float(base["step_ms"] * f_step),
+        }
+    return client_budgets
+
 
 def parse_lora_target_modules(s):
     # Accept JSON list or comma-separated string
@@ -204,9 +283,12 @@ def resolve_lora_targets_and_config_types(model, user_target_modules=None):
             target_modules = ['q_proj', 'v_proj']
 
     # Heterogeneous PEFT type presets.
-    small_r = 8
-    medium_r = 30
-    large_r = 200
+    # Tie the three tiers directly to the canonical
+    # resource levels so that FlexLoRA always picks
+    # ranks from {1, 4, 16}.
+    small_r = RESOURCE_RANKS["poor"]
+    medium_r = RESOURCE_RANKS["medium"]
+    large_r = RESOURCE_RANKS["high"]
 
     if model_type in ["llama", "mistral", "gemma"] and set(
         ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
@@ -396,6 +478,9 @@ def get_density(args, config_local, client_id, config_types):
 def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_local, config=None, config_types=None):
 
     logging.info("The process of federated instruction-tuning has started..")
+    # Reset global communication/compute statistics at the beginning
+    # of each training run.
+    reset_traffic_stats()
     previously_selected_clients_set = set()
     output_dir = os.path.join(output_dir, str(args.num_clients))
 
@@ -541,15 +626,69 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
         elif args.aggregation == 'fedhera':
             # Fed-Hera: 生成每客户端下发包 + 返回全局Wg（可选保存做日志）
-            FedHera(selected_clients_set,
-                    output_dir,
-                    local_dataset_len_dict,
+            FedHera(
+                selected_clients_set,
+                output_dir,
+                local_dataset_len_dict,
+                epoch,
+                client_budgets=FL_training.client_budgets,
+                layer_specs=FL_training.layer_specs,
+                quant_scheme=("bfloat16", "nf4"),
+                use_gpu_svd=True,
+                basis_update_every=args.basis_update_every,
+            )
+            # After FedHera aggregation, log per-client ranks and traffic.
+            if hasattr(FL_training, "layer_specs"):
+                round_transmit_bytes = 0.0
+                round_compute_bytes = 0.0
+                MB = 1024.0 * 1024.0
+                for client_id in selected_clients_set:
+                    push_dir = os.path.join(output_dir, str(client_id), f"server_push_epoch_{epoch}")
+                    meta_path = os.path.join(push_dir, "meta.json")
+                    if not os.path.exists(meta_path):
+                        continue
+                    try:
+                        with open(meta_path, "r") as f:
+                            meta = json.load(f)
+                    except Exception:
+                        continue
+                    client_transmit_bytes = 0.0
+                    client_compute_bytes = 0.0
+                    rank_summary = {}
+                    for layer_key, info in meta.items():
+                        rt = int(info.get("r_tot", 0))
+                        rm = int(info.get("r_main", 0))
+                        rank_summary[layer_key] = {"r_tot": rt, "r_main": rm}
+                        spec = FL_training.layer_specs.get(layer_key)
+                        if spec is None:
+                            continue
+                        d_out = int(spec["d_out"])
+                        d_in = int(spec["d_in"])
+                        bytes_per_rank = (d_out + d_in) * 2.0  # bfloat16 main adapter
+                        if rt > 0:
+                            client_transmit_bytes += bytes_per_rank * rt
+                        if rm > 0:
+                            client_compute_bytes += bytes_per_rank * rm
+
+                    if rank_summary:
+                        logging.info(
+                            "[FedHera][epoch %d][client %s] ranks=%s",
+                            epoch,
+                            str(client_id),
+                            rank_summary,
+                        )
+
+                    round_transmit_bytes += client_transmit_bytes
+                    round_compute_bytes += client_compute_bytes
+
+                TRAFFIC_STATS["FedHera"]["transmit_MB"] += round_transmit_bytes / MB
+                TRAFFIC_STATS["FedHera"]["compute_MB"] += round_compute_bytes / MB
+                logging.info(
+                    "[FedHera][epoch %d] round_transmit_MB=%.3f round_compute_MB=%.3f",
                     epoch,
-                    client_budgets = FL_training.client_budgets,
-                    layer_specs = FL_training.layer_specs,
-                    quant_scheme = ("bfloat16", "nf4"),
-                    use_gpu_svd = True,
-                    basis_update_every = args.basis_update_every)
+                    round_transmit_bytes / MB,
+                    round_compute_bytes / MB,
+                )
             # adapter_model.bin 可存聚合Wg，便于可视化/对照
             # torch.save(_, os.path.join(output_dir, "adapter_model.bin"))
             
@@ -574,10 +713,23 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 current_count += 1
             if current_count > patience:
                 logging.info(f"Best round is {best_round} with test_rouge_L {best_rouge_L}")
+                # Log final communication / compute statistics before exiting.
+                try:
+                    stats = get_traffic_stats()
+                    logging.info("[TrafficSummary] %s", stats)
+                except Exception:
+                    pass
                 return
         local_dataset_len_dict = {}
         import gc
         gc.collect()
+
+    # Training finished without early stopping: record final traffic stats.
+    try:
+        stats = get_traffic_stats()
+        logging.info("[TrafficSummary] %s", stats)
+    except Exception:
+        pass
 
 
 def main():
@@ -664,7 +816,12 @@ def main():
                             v["d_in"] = int(p.shape[1])
 
         # 生成 Fed-Hera 的 per-client 预算
-        client_budgets = build_fedhera_budgets(args.num_clients, args.hetero_mode, seed=args.seed)
+        client_budgets = build_fedhera_budgets_from_layers(
+            args.num_clients,
+            args.hetero_mode,
+            layer_specs,
+            seed=args.seed,
+        )
         # 传入训练循环（避免函数签名大改）
         FL_training.layer_specs = layer_specs
         FL_training.client_budgets = client_budgets
