@@ -5,16 +5,19 @@ import torch
 import peft
 from tqdm import tqdm
 
-def seed_torch(seed):
+def seed_torch(seed, deterministic=False):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.enabled = False
+    # Let cuDNN/TF32 stay fast by default; flip deterministic on only if requested.
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cuda.matmul.allow_tf32 = not deterministic
+    torch.backends.cudnn.allow_tf32 = not deterministic
 
 def tokenize(tokenizer, prompt, cutoff_len=512, add_eos_token=True):
     result = tokenizer(

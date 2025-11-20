@@ -3,16 +3,18 @@ import os
 import numpy as np
 import torch
 
-def seed_torch(seed):
+def seed_torch(seed, deterministic=False):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.enabled = False
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cuda.matmul.allow_tf32 = not deterministic
+    torch.backends.cudnn.allow_tf32 = not deterministic
 
 from .model_aggregation import FedAvg, FlexLoRA, truncate, FedHera
 from .client_participation_scheduling import client_selection

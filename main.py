@@ -1,5 +1,4 @@
 from tqdm import tqdm
-from scipy.stats import norm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 try:
     # For older transformers versions, register newer model types on the fly.
@@ -141,6 +140,10 @@ def read_options():
                         help='name for your experiment')
     parser.add_argument('--seed', default=42, type=int,
                         help='random seed')
+    parser.add_argument('--deterministic', default=False, type=bool,
+                        help='Enable deterministic CUDA kernels (slower, disables TF32/cuDNN benchmark)')
+    parser.add_argument('--device_map', default='cuda', type=str,
+                        help='HuggingFace device_map, e.g., "cuda", "auto", or "balanced"')
 
     ## FL parameters
     parser.add_argument('--aggregation', default='homo', type=str, help = 'aggregation method',
@@ -170,6 +173,8 @@ def read_options():
                         help='local_batch_size')
     parser.add_argument('--local_micro_batch_size', default=2, type=int,
                         help='local_micro_batch_size')
+    parser.add_argument('--dataloader_num_workers', default=4, type=int,
+                        help='Number of worker processes for data loading')
     parser.add_argument('--local_num_epochs', default=1, type=int,
                         help='local epochs for local client training')
     parser.add_argument('--local_learning_rate', default=1e-6, type=float,
@@ -204,7 +209,7 @@ def read_options():
     return args
 
 
-def model_and_tokenizer(global_model, device_map='auto'):
+def model_and_tokenizer(global_model, device_map='cuda'):
     # model = AutoModelForCausalLM.from_pretrained(
     #     global_model,
     #     torch_dtype=torch.bfloat16,
@@ -221,9 +226,14 @@ def model_and_tokenizer(global_model, device_map='auto'):
                     CONFIG_MAPPING._extra_content["mistral"] = LlamaConfig
             except Exception:
                 pass
+    # Accept friendly strings to force a single-GPU placement.
+    map_arg = device_map
+    if isinstance(device_map, str) and device_map.lower() in ["cuda", "gpu", "single", "0"]:
+        map_arg = {"": 0}
+
     model = AutoModelForCausalLM.from_pretrained(
         global_model,
-        device_map=device_map,
+        device_map=map_arg,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
     )
@@ -260,8 +270,8 @@ def resolve_lora_targets_and_config_types(model, user_target_modules=None):
     """
     model_type = getattr(model.config, "model_type", "").lower()
 
-    # If the user explicitly provided a non-default list, respect it.
-    if user_target_modules and user_target_modules != ['q_proj', 'v_proj']:
+    # If the user explicitly provided a list, always respect it verbatim.
+    if user_target_modules:
         target_modules = user_target_modules
     else:
         if model_type in ["llama", "mistral", "gemma"]:
@@ -293,7 +303,6 @@ def resolve_lora_targets_and_config_types(model, user_target_modules=None):
     if model_type in ["llama", "mistral", "gemma"] and set(
         ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
     ).issubset(set(target_modules)):
-        # Preserve original rank patterns for LLaMA-style models.
         config_types = {
             'Type_0': {
                 'q_proj': small_r, 'v_proj': small_r, 'k_proj': small_r, 'o_proj': small_r,
@@ -305,7 +314,7 @@ def resolve_lora_targets_and_config_types(model, user_target_modules=None):
             },
             'Type_2': {
                 'q_proj': medium_r, 'v_proj': medium_r, 'k_proj': medium_r, 'o_proj': medium_r,
-                'gate_proj': large_r, 'down_proj': large_r, 'up_proj': large_r,
+                'gate_proj': medium_r, 'down_proj': medium_r, 'up_proj': medium_r,
             },
             'Type_3': {
                 'q_proj': medium_r, 'v_proj': medium_r, 'k_proj': medium_r, 'o_proj': medium_r,
@@ -324,58 +333,38 @@ def resolve_lora_targets_and_config_types(model, user_target_modules=None):
     return target_modules, config_types
 
 
-def get_peft(config_types, num_clients, strategy=None):
+def _resource_probabilities(mode: str):
+    """
+    Map hetero mode to (low, medium, high) probabilities.
+    """
+    if mode == 'normal':
+        return [0.25, 0.5, 0.25]
+    if mode == 'heavy_tail':
+        return [0.6, 0.3, 0.1]
+    if mode == 'heavy_tail_strong':
+        return [0.2, 0.2, 0.6]
+    # default / random
+    return [1/3, 1/3, 1/3]
+
+
+def get_peft(config_types, num_clients, strategy=None, hetero_mode="random", seed=42):
     """
     get each client's unique LoRA configuration based on the "aggregation" parameter
     """
     if strategy in ['homo', 'fedhera']:
         return {'alpha': 16, 'lora_dropout': 0.05}
-    else:
-        # random select lora type for clients
-        if strategy == 'random':
-            config_local = {'alpha':16, 'lora_dropout':0.05}
-            for i in range(num_clients):
-                type = 'Type_' + str(np.random.randint(0, 4))
-                config_local['Client_' + str(i)] = config_types[type]
-        elif strategy == 'heavy_tail':
-            config_local = {'alpha':16, 'lora_dropout':0.05}
-            for i in range(num_clients):
-                rand_num = random.random()  # Generate a random float between 0 and 1
-                if rand_num < 0.80:
-                    type = 'Type_0'
-                elif rand_num < 0.90:
-                    type = 'Type_1'
-                elif rand_num < 0.95:
-                    type = 'Type_2'
-                else:
-                    type = 'Type_3'
-                config_local['Client_' + str(i)] = config_types[type]
-        elif strategy == 'heavy_tail_strong':
-            config_local = {'alpha':16, 'lora_dropout':0.05}
-            for i in range(num_clients):
-                rand_num = random.random()  # Generate a random float between 0 and 1
-                if rand_num < 0.80:
-                    type = 'Type_1'
-                elif rand_num < 0.90:
-                    type = 'Type_2'
-                elif rand_num < 0.95:
-                    type = 'Type_3'
-                else:
-                    type = 'Type_0'
-                config_local['Client_' + str(i)] = config_types[type]
-        elif strategy == 'normal':
-            config_local = {'alpha': 16, 'lora_dropout': 0.05}
-            positions = np.array([0, 3, 2, 1])
-            mu = 1.5
-            sigma = 0.7
-            probabilities = norm.pdf(positions, mu, sigma)
-            probabilities /= probabilities.sum()
-            for i in range(num_clients):
-                selected_var = np.random.choice(positions, p=probabilities)
-                type = 'Type_' + str(selected_var)
-                config_local['Client_' + str(i)] = config_types[type]
+    rng = np.random.default_rng(seed)
+    probs = _resource_probabilities(hetero_mode or strategy or "random")
+    # Tie resource tiers directly to ranks: low->Type_0 (rank 1), medium->Type_2 (rank 4), high->Type_1 (rank 16).
+    tier_to_type = {"low": "Type_0", "medium": "Type_2", "high": "Type_1"}
+    tiers = ["low", "medium", "high"]
 
-        return config_local
+    config_local = {'alpha': 16, 'lora_dropout': 0.05}
+    for i in range(num_clients):
+        tier = rng.choice(tiers, p=probs)
+        type_key = tier_to_type[tier]
+        config_local['Client_' + str(i)] = config_types[type_key]
+    return config_local
 
 def local_client_load_weight(args, model, epoch, global_params=None):
     """
@@ -511,7 +500,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             args.local_learning_rate=args.local_learning_rate/2
 
         if args.baseline == 'slora' and epoch == args.R_1:
-            model, tokenizer = model_and_tokenizer(global_model=args.global_model, device_map='auto')
+            model, tokenizer = model_and_tokenizer(global_model=args.global_model, device_map=args.device_map)
             # IMPORTANT: get_peft_model returns a wrapped model; assign it back
             model = get_peft_model(model, config, adapter_name='local')
 
@@ -572,7 +561,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 local_client_load_weight(args, model, epoch, global_params=global_params)
 
             client = GeneralClient(client_id, model, tokenizer, prompter, data_path, output_dir, cache_dir=args.cache_dir,
-                                   hetero_lora = False, optim = optim)
+                                   hetero_lora = False, optim = optim, dataloader_num_workers=args.dataloader_num_workers)
 
             logging.info("\nPreparing the local dataset and trainer for Client_{}".format(client_id))
             client.preprare_local_dataset()
@@ -734,7 +723,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
 
 def main():
     args = read_options()
-    seed_torch(args.seed)
+    seed_torch(args.seed, deterministic=args.deterministic)
     if not os.path.exists(args.session_name):
         os.makedirs(args.session_name)
     if args.output_dir:
@@ -760,7 +749,7 @@ def main():
         output_dir = os.path.join(args.session_name, args.aggregation)
 
     # set up the global model & tokenizer
-    model, tokenizer = model_and_tokenizer(global_model=args.global_model, device_map='auto')
+    model, tokenizer = model_and_tokenizer(global_model=args.global_model, device_map=args.device_map)
 
     prompter = Prompter(args.prompt_template_name)
 
@@ -769,7 +758,13 @@ def main():
         model,
         user_target_modules=args.lora_target_modules,
     )
-    config_local = get_peft(config_types, num_clients=args.num_clients, strategy=args.aggregation)
+    config_local = get_peft(
+        config_types,
+        num_clients=args.num_clients,
+        strategy=args.aggregation,
+        hetero_mode=args.hetero_mode,
+        seed=args.seed,
+    )
 
     logging.info(config_local)
 

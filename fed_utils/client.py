@@ -15,7 +15,7 @@ import numpy as np
 
 class GeneralClient:
     def __init__(self, client_id, model, tokenizer, prompter, data_path, output_dir, cutoff_len=512, train_on_inputs=True,
-                 cache_dir = None, hetero_lora = False, optim = 'adamw_torch'):
+                 cache_dir = None, hetero_lora = False, optim = 'adamw_torch', dataloader_num_workers=4):
         self.client_id = client_id
         self.model = model
         self.tokenizer = tokenizer
@@ -34,6 +34,8 @@ class GeneralClient:
         self.scheduler = None
         self.hetero_lora = hetero_lora
         self.optim = optim
+        self.dataloader_num_workers = dataloader_num_workers
+        self.pin_memory = torch.cuda.is_available()
 
     def generate_and_tokenize_prompt(self, data_point):
         full_prompt = self.prompter.generate_prompt(
@@ -157,6 +159,8 @@ class GeneralClient:
             output_dir=self.local_output_dir,
             group_by_length=group_by_length,
             dataloader_drop_last=False,
+            dataloader_num_workers=self.dataloader_num_workers,
+            dataloader_pin_memory=use_cuda,
         )
         # Optimizer preparation
         optimizer = None
@@ -288,6 +292,8 @@ class GeneralClient:
             per_device_eval_batch_size=local_micro_batch_size,
             dataloader_drop_last=False,
             eval_accumulation_steps=4,
+            dataloader_num_workers=self.dataloader_num_workers,
+            dataloader_pin_memory=use_cuda,
         )
 
         def compute_metrics(pred):
