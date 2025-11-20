@@ -512,6 +512,9 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             del train_data
             total_data_num += local_dataset_len_dict[client_id]
 
+            # Align this client's LoRA ranks with its resource tier before loading weights.
+            local_client_modify_layer(args, epoch, config_local, model, client_id)
+
             # Fed-Hera: 尝试加载 server_push 包（若本轮生成）
             from fed_utils.adaptive_peft import load_weight_fedhera_if_exists, apply_lora_prefix_mask
             prev_epoch = max(0, epoch - 1)
