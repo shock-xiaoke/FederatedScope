@@ -167,6 +167,7 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             quant_scheme=("fp16","nf4"),    # (quant_main, quant_res) 控制字节估算
             use_gpu_svd=False,              # 可选：GPU 上做SVD
             basis_update_every=5,           # 每 K 轮更新一次基底
+            fixed_client_ranks=None,        # Optional Dict[client_id] -> fixed LoRA rank per layer
             ):
     """
     返回聚合后的 "全局Wg"（便于日志/可视化），并在磁盘上为每客户端写入 server_push 包。
@@ -233,6 +234,11 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
         B_down_bytes = int(budgets["B_down_MB"] * 1024 * 1024)
         M_bytes      = int(budgets["VRAM_MB"]   * 1024 * 1024)
         T_ms         = float(budgets["step_ms"])
+        target_rank = None
+        if fixed_client_ranks is not None:
+            target_rank = int(fixed_client_ranks.get(int(client_id), 0))
+            if target_rank < 0:
+                target_rank = 0
 
         # 准备层元信息
         layers = {}
@@ -255,7 +261,10 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             c_time_per_col[layer_key] = 1.0
 
         # 下载水位
-        r_tot, _ = allocate_r_tot_for_client(layers, B_down_bytes, bytes_per_col)
+        if target_rank is not None and target_rank > 0:
+            r_tot = {L: min(target_rank, len(meta["sigma"])) for L, meta in layers.items()}
+        else:
+            r_tot, _ = allocate_r_tot_for_client(layers, B_down_bytes, bytes_per_col)
         # 训练水位
         r_main, _, _ = allocate_r_main_for_client(layers, r_tot, M_bytes, T_ms, c_mem_per_col, c_time_per_col)
 

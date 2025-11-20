@@ -40,22 +40,36 @@ import json
 # These are used both for heterogeneous FlexLoRA ranks and, via
 # Fed-Hera, for computing client resource budgets.
 RESOURCE_RANKS = {
-    "poor": 1,
-    "medium": 4,
+    "poor": 4,
+    "medium": 8,
     "high": 16,
 }
 
+# Deterministic client rank map for comparability.
+def build_fixed_rank_map(num_clients):
+    rank_map = {}
+    for i in range(num_clients):
+        if 0 <= i <= 4:
+            rank = 4
+        elif 5 <= i <= 14:
+            rank = 8
+        elif 15 <= i <= 19:
+            rank = 16
+        else:
+            # Default to the medium tier for any additional clients.
+            rank = RESOURCE_RANKS["medium"]
+        rank_map[i] = rank
+    return rank_map
 
-def build_fedhera_budgets_from_layers(num_clients, hetero_mode, layer_specs, seed=42):
+
+def build_fedhera_budgets_from_layers(num_clients, hetero_mode, layer_specs, seed=42, fixed_ranks=None):
     """
     Compute Fed-Hera client budgets based on LoRA computation.
 
     The three resource tiers (poor/medium/high) are calibrated so
-    that they can roughly sustain LoRA ranks {1, 4, 16} across
-    all LoRA layers, assuming bfloat16 storage for the main adapter.
+    that they can roughly sustain LoRA ranks across all LoRA layers,
+    assuming bfloat16 storage for the main adapter.
     """
-    rng = np.random.default_rng(seed)
-
     # Aggregate per-column costs over LoRA layers.
     bytes_per_elem_main = 2.0  # bfloat16 main adapter in Fed-Hera.
     total_bytes_per_col = 0.0
@@ -77,6 +91,22 @@ def build_fedhera_budgets_from_layers(num_clients, hetero_mode, layer_specs, see
             "VRAM_MB": total_mem_per_col * rank / MB,
             "step_ms": total_time_per_col * rank,
         }
+
+    # Deterministic budgets when a fixed rank map is provided.
+    if fixed_ranks is not None:
+        client_budgets = {}
+        for i in range(num_clients):
+            rank = int(fixed_ranks.get(i, RESOURCE_RANKS["medium"]))
+            base = tier_for_rank(rank)
+            client_budgets[i] = {
+                "tier": f"fixed_r{rank}",
+                "B_down_MB": float(base["B_down_MB"]),
+                "VRAM_MB": float(base["VRAM_MB"]),
+                "step_ms": float(base["step_ms"]),
+            }
+        return client_budgets
+
+    rng = np.random.default_rng(seed)
 
     poor_rank = RESOURCE_RANKS.get("poor", 1)
     medium_rank = RESOURCE_RANKS.get("medium", 4)
@@ -347,15 +377,24 @@ def _resource_probabilities(mode: str):
     return [1/3, 1/3, 1/3]
 
 
-def get_peft(config_types, num_clients, strategy=None, hetero_mode="random", seed=42):
+def get_peft(config_types, num_clients, strategy=None, hetero_mode="random", seed=42, fixed_ranks=None):
     """
     get each client's unique LoRA configuration based on the "aggregation" parameter
     """
     if strategy in ['homo', 'fedhera']:
         return {'alpha': 16, 'lora_dropout': 0.05}
+    # Use a deterministic rank map when provided to align with Fed-Hera comparisons.
+    module_template = next(iter(config_types.values()), {})
+    base_modules = list(module_template.keys())
+    if fixed_ranks is not None:
+        config_local = {'alpha': 16, 'lora_dropout': 0.05}
+        for i in range(num_clients):
+            rank = int(fixed_ranks.get(i, RESOURCE_RANKS["medium"]))
+            config_local['Client_' + str(i)] = {m: rank for m in base_modules}
+        return config_local
     rng = np.random.default_rng(seed)
     probs = _resource_probabilities(hetero_mode or strategy or "random")
-    # Tie resource tiers directly to ranks: low->Type_0 (rank 1), medium->Type_2 (rank 4), high->Type_1 (rank 16).
+    # Tie resource tiers directly to ranks: low->Type_0 (rank 4), medium->Type_2 (rank 8), high->Type_1 (rank 16).
     tier_to_type = {"low": "Type_0", "medium": "Type_2", "high": "Type_1"}
     tiers = ["low", "medium", "high"]
 
@@ -519,7 +558,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             from fed_utils.adaptive_peft import load_weight_fedhera_if_exists, apply_lora_prefix_mask
             prev_epoch = max(0, epoch - 1)
             pkg, meta = load_weight_fedhera_if_exists(output_dir, client_id, prev_epoch)
-            hera_hooks = None
+            hera_hooks = None  # Initialize here for each client
             if pkg is not None and meta is not None:
                 # 1) 先把每个 base_key (xxx.q_proj.lora) 映射成模块名 (xxx.q_proj)，用于改 LoRA rank
                 per_layer_r_tot = {}
@@ -625,6 +664,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 epoch,
                 client_budgets=FL_training.client_budgets,
                 layer_specs=FL_training.layer_specs,
+                fixed_client_ranks=getattr(FL_training, "fixed_ranks", None),
                 quant_scheme=("bfloat16", "nf4"),
                 use_gpu_svd=True,
                 basis_update_every=args.basis_update_every,
@@ -755,6 +795,7 @@ def main():
     model, tokenizer = model_and_tokenizer(global_model=args.global_model, device_map=args.device_map)
 
     prompter = Prompter(args.prompt_template_name)
+    fixed_ranks = build_fixed_rank_map(args.num_clients)
 
     # Choose model-appropriate LoRA target modules and heterogeneity configs.
     lora_target_modules, config_types = resolve_lora_targets_and_config_types(
@@ -767,6 +808,7 @@ def main():
         strategy=args.aggregation,
         hetero_mode=args.hetero_mode,
         seed=args.seed,
+        fixed_ranks=fixed_ranks,
     )
 
     logging.info(config_local)
@@ -819,10 +861,12 @@ def main():
             args.hetero_mode,
             layer_specs,
             seed=args.seed,
+            fixed_ranks=fixed_ranks,
         )
         # 传入训练循环（避免函数签名大改）
         FL_training.layer_specs = layer_specs
         FL_training.client_budgets = client_budgets
+        FL_training.fixed_ranks = fixed_ranks
 
     # world_size = int(os.environ.get("WORLD_SIZE", 1))
     # ddp = world_size != 1
