@@ -567,7 +567,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 epoch,
                 client_budgets=FL_training.client_budgets,
                 layer_specs=FL_training.layer_specs,
-                fixed_client_ranks=getattr(FL_training, "fixed_ranks", None),
+                fixed_client_ranks=None,
                 quant_scheme=("bfloat16", "nf4"),
                 use_gpu_svd=True,
                 basis_update_every=args.basis_update_every,
@@ -701,7 +701,11 @@ def main():
     model, tokenizer = model_and_tokenizer(global_model=args.global_model, device_map=args.device_map)
 
     prompter = Prompter(args.prompt_template_name)
-    fixed_ranks = build_fixed_rank_map(args.num_clients)
+    # For FedHera, respect setting_A/setting_B budgets (no fixed ranks); other modes keep deterministic ranks.
+    if args.aggregation == 'fedhera':
+        fixed_ranks = None
+    else:
+        fixed_ranks = build_fixed_rank_map(args.num_clients)
 
     # Choose model-appropriate LoRA target modules and heterogeneity configs.
     lora_target_modules, config_types = resolve_lora_targets_and_config_types(
@@ -767,12 +771,11 @@ def main():
             args.hetero_mode,
             layer_specs,
             seed=args.seed,
-            fixed_ranks=fixed_ranks,
         )
         # 传入训练循环（避免函数签名大改）
         FL_training.layer_specs = layer_specs
         FL_training.client_budgets = client_budgets
-        FL_training.fixed_ranks = fixed_ranks
+        FL_training.fixed_ranks = None
 
     # world_size = int(os.environ.get("WORLD_SIZE", 1))
     # ddp = world_size != 1
