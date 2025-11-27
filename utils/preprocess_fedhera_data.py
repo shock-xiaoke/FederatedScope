@@ -107,6 +107,48 @@ def _to_fedhera_example_e2e(example: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _to_fedhera_example_gsm8k(example: Dict[str, Any]) -> Dict[str, Any]:
+    """Map GSM8K math word problems to (instruction, input, output)."""
+    question = example.get("question") or example.get("input") or ""
+    answer = example.get("answer") or example.get("output") or ""
+    instruction = (
+        "Solve the following math word problem and provide the final numeric answer."
+    )
+    return {
+        "instruction": instruction,
+        "input": question,
+        "output": answer,
+        "category": "GSM8K",
+    }
+
+
+def _to_fedhera_example_hellaswag(example: Dict[str, Any]) -> Dict[str, Any]:
+    """Map HellaSwag examples to a multiple-choice style prompt."""
+    ctx_a = example.get("ctx_a") or ""
+    ctx_b = example.get("ctx_b") or ""
+    context = (ctx_a + " " + ctx_b).strip()
+    endings = example.get("endings") or []
+    label = example.get("label")
+    try:
+        label = int(label)
+    except Exception:
+        label = None
+    correct = endings[label] if label is not None and label < len(endings) else ""
+    options = []
+    for idx, opt in enumerate(endings):
+        letter = chr(ord("A") + idx)
+        options.append(f"({letter}) {opt}")
+    options_text = "\n".join(options)
+    prompt_input = f"Context: {context}\nOptions:\n{options_text}\nChoose the best ending."
+    instruction = "Pick the option (A/B/C/D) that best completes the context."
+    return {
+        "instruction": instruction,
+        "input": prompt_input,
+        "output": correct,
+        "category": "HellaSwag",
+    }
+
+
 def _split_across_clients(
     records: List[Dict[str, Any]],
     num_clients: int,
@@ -168,13 +210,18 @@ def _save_client_splits(
             json.dump(parts["test"], f, ensure_ascii=False)
 
 
-def _load_source_dataset(task: str, hf_dataset: str | None, data_files: str | None, split: str) -> Dataset:
+def _load_source_dataset(task: str, hf_dataset: str | None, data_files: str | None, split: str, hf_config: str | None) -> Dataset:
     """
     Load a source dataset either from Hugging Face Hub (hf_dataset)
     or from local JSON/JSONL/CSV files (data_files).
     """
     if hf_dataset:
-        ds = load_dataset(hf_dataset, split=split)
+        # Some datasets (e.g., openai/gsm8k) require an explicit config ("main"/"socratic").
+        load_kwargs = {"split": split}
+        if hf_config and str(hf_config).lower() != "none":
+            ds = load_dataset(hf_dataset, name=hf_config, **load_kwargs)
+        else:
+            ds = load_dataset(hf_dataset, **load_kwargs)
     else:
         if data_files is None:
             raise ValueError("Either --hf_dataset or --data_files must be provided.")
@@ -195,8 +242,9 @@ def preprocess_task(
     num_clients: int,
     max_examples: int | None,
     seed: int = 42,
+    hf_config: str | None = None,
 ) -> None:
-    ds = _load_source_dataset(task, hf_dataset, data_files, split)
+    ds = _load_source_dataset(task, hf_dataset, data_files, split, hf_config)
 
     if max_examples is not None:
         ds = ds.shuffle(seed=seed).select(range(min(max_examples, len(ds))))
@@ -208,6 +256,10 @@ def preprocess_task(
         mapper = _to_fedhera_example_commonsense
     elif task == "e2e_nlg":
         mapper = _to_fedhera_example_e2e
+    elif task == "gsm8k":
+        mapper = _to_fedhera_example_gsm8k
+    elif task == "hellaswag":
+        mapper = _to_fedhera_example_hellaswag
     else:
         raise ValueError(f"Unsupported task: {task}")
 
@@ -228,7 +280,7 @@ def parse_args() -> argparse.Namespace:
         "--task",
         type=str,
         required=True,
-        choices=["metamathqa", "commonsense", "e2e_nlg"],
+        choices=["metamathqa", "commonsense", "e2e_nlg", "gsm8k", "hellaswag"],
         help="Which task to preprocess.",
     )
     parser.add_argument(
@@ -242,6 +294,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional local data files path (JSON/JSONL/CSV) if not using hf_dataset.",
+    )
+    parser.add_argument(
+        "--hf_config",
+        type=str,
+        default=None,
+        help="Optional dataset config name when loading from Hugging Face (e.g., 'main' for openai/gsm8k).",
     )
     parser.add_argument(
         "--split",
@@ -287,9 +345,9 @@ def main() -> None:
         num_clients=args.num_clients,
         max_examples=args.max_examples,
         seed=args.seed,
+        hf_config=args.hf_config,
     )
 
 
 if __name__ == "__main__":
     main()
-

@@ -128,6 +128,8 @@ def read_options():
                         help='name for your experiment')
     parser.add_argument('--seed', default=42, type=int,
                         help='random seed')
+    parser.add_argument('--save_model', action='store_true', default=False,
+                        help='If set, save aggregated adapter_model.bin; otherwise only logs are kept')
     parser.add_argument('--deterministic', default=False, type=bool,
                         help='Enable deterministic CUDA kernels (slower, disables TF32/cuDNN benchmark)')
     parser.add_argument('--device_map', default='cuda', type=str,
@@ -555,7 +557,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                                    local_dataset_len_dict,
                                    epoch,
                                    )
-            torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
+            if args.save_model:
+                torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
         elif args.aggregation == 'fedhera':
             FedHera(
                 selected_clients_set,
@@ -630,7 +633,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                                    local_dataset_len_dict,
                                    epoch,
                                    )
-            torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
+            if args.save_model:
+                torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
             global_params = distribute_weight_fast(global_params, config_local)
         else:
             raise ValueError(f"Unsupported aggregation mode: {args.aggregation}")
@@ -671,16 +675,16 @@ def main():
     seed_torch(args.seed, deterministic=args.deterministic)
     if not os.path.exists(args.session_name):
         os.makedirs(args.session_name)
-    if args.output_dir:
-        if not os.path.exists(os.path.join(args.output_dir, args.session_name)):
-            os.makedirs(os.path.join(args.output_dir, args.session_name))
-        logging.basicConfig(filename=os.path.join(args.output_dir, args.session_name, '../result.log'),
-                            level=logging.INFO,
-                            format='%(message)s')
-    else:
-        logging.basicConfig(filename=os.path.join(args.session_name, '../result.log'),
-                            level=logging.INFO,
-                            format='%(message)s')
+    log_dir = "/root/nfs/fedhera"
+    os.makedirs(log_dir, exist_ok=True)
+    model_tag = os.path.basename(str(args.global_model)).replace("/", "_")
+    dataset_tag = os.path.basename(os.path.normpath(args.data_path))
+    log_name = f"{args.aggregation}_{args.hetero_mode}_{model_tag}_{dataset_tag}_r{args.lora_r}.log"
+    log_path = os.path.join(log_dir, log_name)
+    logging.basicConfig(filename=log_path,
+                        level=logging.INFO,
+                        format='%(message)s')
+    logging.info("Logging to %s", log_path)
     logging.info("Initial training parameters %s", args)
     print(args)
 
