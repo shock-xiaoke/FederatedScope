@@ -15,15 +15,16 @@ def allocate_r_tot_for_client(layers, B_down_bytes, bytes_per_col):
     norm_sigma = {}
     for L, meta in layers.items():
         sigma = meta.get("sigma", np.array([]))
-        denom = float(np.sum(sigma)) if sigma is not None else 0.0
-        norm_sigma[L] = (sigma / max(denom, 1e-12)).astype(float)
+        sigma_sq = sigma.astype(float)**2
+        denom = sigma_sq.sum() + 1e-12
+        norm_sigma[L] = sigma_sq / denom
 
     while True:
         best = None
         for L, meta in layers.items():
             r = r_tot[L]
             if r < len(norm_sigma[L]):
-                gain = norm_sigma[L][r] ** 2 / max(bytes_per_col[L], 1)
+                gain = norm_sigma[L][r] / max(bytes_per_col[L], 1)
                 if (best is None) or (gain > best[0]):
                     best = (gain, L)
         if best is None: break
@@ -46,8 +47,9 @@ def allocate_r_main_for_client(layers, r_tot, M_bytes, T_ms, c_mem_per_col, c_ti
     norm_sigma = {}
     for L, meta in layers.items():
         sigma = meta.get("sigma", np.array([]))
-        denom = float(np.sum(sigma)) if sigma is not None else 0.0
-        norm_sigma[L] = (sigma / max(denom, 1e-12)).astype(float)
+        sigma_sq = sigma.astype(float)**2
+        denom = sigma_sq.sum() + 1e-12
+        norm_sigma[L] = sigma_sq / denom
 
     # Reserve a minimum per layer so r_tot - r_main <= 2 whenever budgets allow.
     for L, rt in r_tot.items():
@@ -61,15 +63,18 @@ def allocate_r_main_for_client(layers, r_tot, M_bytes, T_ms, c_mem_per_col, c_ti
             T_left -= c_time_per_col[L]
 
     while True:
-        a = (1.0 / max(T_left, 1e-9)) if alpha is None else alpha
-        b = (1.0 / max(M_left, 1e-9)) if beta  is None else beta
+        invT = 1.0 / max(T_left/T_ms, 1e-9)
+        invM = 1.0 / max(M_left/M_bytes, 1e-9)
+
+        a = (invT / invT + invM) if alpha is None else alpha
+        b = (invM / invT + invM) if beta  is None else beta
         best = None
         for L, meta in layers.items():
             r = r_main[L]
             if r >= min(r_tot[L], len(norm_sigma[L])):
                 continue
             unit_cost = a * c_time_per_col[L] + b * c_mem_per_col[L]
-            gain = norm_sigma[L][r] ** 2 / max(unit_cost, 1e-9)
+            gain = norm_sigma[L][r] / max(unit_cost, 1e-9)
             if (best is None) or (gain > best[0]):
                 best = (gain, L)
         if best is None: break

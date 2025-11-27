@@ -50,32 +50,6 @@ def load_weight_local(weighted_single_weights, model):
                 weight_dict[name] = weighted_single_weights[name + '.' + str(rank)]
     return weight_dict
 
-def load_weight_SLoRA(weighted_single_weights, model):
-    weight_dict = {}
-    with torch.no_grad():
-        for key, val in weighted_single_weights.items():
-            for name, param in model.named_parameters():
-                if key == name:
-                    weight_dict[key] = val.to(param.data.device) - param
-
-        model_tune_param = {name: param for name, param in model.named_parameters() if param.requires_grad}
-        for key, val in weight_dict.items():
-            key_check = '.'.join(key.split('.')[:-1])
-            for name, param in model_tune_param.items():
-                if key_check in name and 'lora_A' in name:
-                    rank = min(param.shape)
-                    merge_rate = 16/rank
-                    W_cpu = weight_dict[key].detach().to('cpu')
-                    u, s, vT = torch.linalg.svd(W_cpu, full_matrices=False)
-                    u = u[:, :rank]
-                    s = s[:rank]
-                    v = vT[:rank, :]
-                    lora_B = u @ torch.diag(s)/merge_rate
-                    lora_A = v
-                    model_tune_param[name] = lora_A
-                    B_name = name.replace('lora_A', 'lora_B')
-                    model_tune_param[B_name] = lora_B
-    return model_tune_param
 
 def distribute_weight(weighted_single_weights, model):
     # mode is local model

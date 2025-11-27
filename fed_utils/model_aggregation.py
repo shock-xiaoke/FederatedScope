@@ -162,22 +162,61 @@ import json
 from .rank_allocator import allocate_r_tot_for_client, allocate_r_main_for_client
 
 def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
-            client_budgets,                 # Dict[client_id] -> {"B_down_MB","VRAM_MB","step_ms"}
-            layer_specs,                    # Dict[layer_key] -> {"d_out","d_in"}
-            quant_scheme=("fp16","nf4"),    # (quant_main, quant_res) 控制字节估算
-            use_gpu_svd=False,              # 可选：GPU 上做SVD
-            basis_update_every=5,           # 每 K 轮更新一次基底
-            fixed_client_ranks=None,        # Optional Dict[client_id] -> fixed LoRA rank per layer
-            ):
+            client_budgets,
+            layer_specs,
+            quant_scheme=("fp16", "nf4"),
+            use_gpu_svd=False,
+            basis_update_every=5,
+            fixed_client_ranks=None,
+            ablation=None):
     """
-    返回聚合后的 "全局Wg"（便于日志/可视化），并在磁盘上为每客户端写入 server_push 包。
+    Fed-Hera aggregation:
+    1) Merge client adapters into W_global.
+    2) Run SVD to refresh basis.
+    3) Allocate r_tot/r_main per client (water-filling or ablation).
+    4) Push truncated A/B plus meta (r_main) back to clients.
     """
-    # 1) 读入各客户端本轮 LoRA，合成 Wg（与 FlexLoRA 类似）
+    def _uniform_allocation(layers, bytes_per_col, c_mem_per_col, c_time_per_col,
+                            B_down_bytes, M_bytes, T_ms, target_rank=None):
+        total_bytes = max(sum(bytes_per_col.values()), 1)
+        uniform_cap = B_down_bytes // total_bytes
+        if target_rank is not None and target_rank > 0:
+            uniform_cap = min(uniform_cap, target_rank)
+        r_tot = {L: int(min(uniform_cap, len(meta["sigma"]))) for L, meta in layers.items()}
+        mem_denom = max(sum(c_mem_per_col.values()), 1)
+        time_denom = max(sum(c_time_per_col.values()), 1)
+        r_main_cap = int(min(uniform_cap, M_bytes // mem_denom, T_ms // time_denom))
+        r_main = {L: int(min(rt, r_main_cap)) for L, rt in r_tot.items()}
+        return r_tot, r_main
+
+    def _random_allocation(layers, bytes_per_col, c_mem_per_col, c_time_per_col,
+                           B_down_bytes, M_bytes, T_ms, target_rank=None, rng=None):
+        rng = rng or np.random.default_rng()
+        caps = {
+            L: int(min(len(meta["sigma"]), target_rank)) if target_rank else int(len(meta["sigma"]))
+            for L, meta in layers.items()
+        }
+        r_tot = {L: 0 for L in layers}
+        remaining = B_down_bytes
+        layer_keys = list(layers.keys())
+        while True:
+            candidates = [k for k in layer_keys if r_tot[k] < caps[k] and remaining >= bytes_per_col[k]]
+            if not candidates:
+                break
+            choice = rng.choice(candidates)
+            r_tot[choice] += 1
+            remaining -= bytes_per_col[choice]
+        mem_denom = max(sum(c_mem_per_col.values()), 1)
+        time_denom = max(sum(c_time_per_col.values()), 1)
+        r_main_cap = int(min(M_bytes // mem_denom, T_ms // time_denom))
+        r_main = {L: int(min(rt, r_main_cap)) for L, rt in r_tot.items()}
+        return r_tot, r_main
+
     weights_array = torch.tensor([local_dataset_len_dict[c] for c in selected_clients_set], dtype=torch.float32)
     weights_array = torch.nn.functional.normalize(weights_array, p=1, dim=0)
 
     with torch.no_grad():
-        aggregated = {}  # key(".lora") -> Tensor [d_out, d_in]
+        aggregated = {}
         for k, client_id in tqdm(enumerate(selected_clients_set)):
             single_output = os.path.join(output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin")
             state = torch.load(single_output, map_location="cpu")
@@ -185,7 +224,7 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                 if 'local' in key and 'bias' not in key and ('lora_A' in key):
                     B_key = key.replace('lora_A', 'lora_B')
                     rank = state[B_key].shape[1]
-                    merge_rate = 16 / rank
+                    merge_rate = 16 / max(rank, 1)
                     base_key = '.'.join(key.split('.')[:-3]) + '.lora'
                     merged = (state[B_key] @ state[key]) * merge_rate * weights_array[k]
                     if base_key not in aggregated:
@@ -195,10 +234,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             del state
             torch.cuda.empty_cache()
 
-    # 2) 是否需要本轮更新基底（可每 K 轮）
     basis_version = epoch // max(basis_update_every, 1)
 
-    # 3) 对每层做 SVD，准备每层奇异值谱与 U,S,V
     per_layer_USV = {}
     for layer_key in list(aggregated.keys()):
         Wg = aggregated[layer_key]
@@ -211,36 +248,28 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             "Vh": Vh.to("cpu"),
             "sigma": S.detach().cpu().numpy(),
         }
-
-        # free this layer’s big matrices
         del Wg, W, U, S, Vh
         torch.cuda.empty_cache()
 
-    import gc
     gc.collect()
 
-    # 4) 为每客户端做 rank 分配并写入 server_push 包
     quant_main, quant_res = quant_scheme
-    BYTE_MAP = {"fp16":2, "bfloat16":2, "int8":1, "nf4":0.5, "int4":0.5}
+    BYTE_MAP = {"fp16": 2, "bfloat16": 2, "int8": 1, "nf4": 0.5, "int4": 0.5}
     bytes_down_main = BYTE_MAP.get(quant_main, 2.0)
-    bytes_down_res  = BYTE_MAP.get(quant_res, 0.5)
     MB = 1024.0 * 1024.0
-    round_transmit_bytes = 0.0
-    round_compute_bytes = 0.0
-    # 统一用 "每列字节" 估算：(d_out + d_in) * bytes
-    # 下发时我们一次性给到 r_tot 列（包含 main+res），bytes 用更保守的主精度估。
+    rng = np.random.default_rng()
+
     for client_id in selected_clients_set:
         budgets = client_budgets[int(client_id)]
-        B_down_bytes = int(budgets["B_down_MB"] * 1024 * 1024)
-        M_bytes      = int(budgets["VRAM_MB"]   * 1024 * 1024)
-        T_ms         = float(budgets["step_ms"])
+        B_down_bytes = int(budgets["B_down_MB"] * MB)
+        M_bytes = int(budgets["VRAM_MB"] * MB)
+        T_ms = float(budgets["step_ms"])
         target_rank = None
         if fixed_client_ranks is not None:
             target_rank = int(fixed_client_ranks.get(int(client_id), 0))
             if target_rank < 0:
                 target_rank = 0
 
-        # 准备层元信息
         layers = {}
         bytes_per_col = {}
         c_mem_per_col = {}
@@ -253,51 +282,53 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                 d_out = int(usv["U"].shape[0])
                 d_in = int(usv["Vh"].shape[1])
             sigma = usv["sigma"]
-            layers[layer_key] = {"sigma": sigma, "d_out":d_out, "d_in":d_in}
+            layers[layer_key] = {"sigma": sigma, "d_out": d_out, "d_in": d_in}
             bytes_per_col[layer_key] = int((d_out + d_in) * bytes_down_main)
-            # 训练侧开销估算：显存 bytes（考虑优化器多副本）
-            c_mem_per_col[layer_key]  = int((d_out + d_in) * 2.0 * 3.5)  # 2B(bf16)×(1参数+优化器状态系数~3.5)
-            # 步时线性斜率：给个常数，也可通过 burn-in 标定
+            c_mem_per_col[layer_key] = int((d_out + d_in) * 2.0 * 3.5)
             c_time_per_col[layer_key] = 1.0
 
-        # 下载水位
-        if target_rank is not None and target_rank > 0:
-            r_tot = {L: min(target_rank, len(meta["sigma"])) for L, meta in layers.items()}
+        if ablation == "uniform":
+            r_tot, r_main = _uniform_allocation(layers, bytes_per_col, c_mem_per_col, c_time_per_col,
+                                                B_down_bytes, M_bytes, T_ms, target_rank)
+        elif ablation == "random":
+            r_tot, r_main = _random_allocation(layers, bytes_per_col, c_mem_per_col, c_time_per_col,
+                                               B_down_bytes, M_bytes, T_ms, target_rank, rng)
         else:
-            r_tot, _ = allocate_r_tot_for_client(layers, B_down_bytes, bytes_per_col)
-        # 训练水位
-        r_main, _, _ = allocate_r_main_for_client(layers, r_tot, M_bytes, T_ms, c_mem_per_col, c_time_per_col)
+            if target_rank is not None and target_rank > 0:
+                r_tot = {L: min(target_rank, len(meta["sigma"])) for L, meta in layers.items()}
+            else:
+                r_tot, _ = allocate_r_tot_for_client(layers, B_down_bytes, bytes_per_col)
+            r_main, _, _ = allocate_r_main_for_client(layers, r_tot, M_bytes, T_ms, c_mem_per_col, c_time_per_col)
 
-        # 生成该客户端的下发包：按 r_tot 截取 U,S,V 并合成为 B,A；同时附上 r_main 掩码信息
         push_dir = os.path.join(output_dir, str(client_id), f"server_push_epoch_{epoch}")
         os.makedirs(push_dir, exist_ok=True)
         pkg = {}
         meta = {}
+        ablation_mode = ablation if ablation is not None else "water_filling"
         for layer_key, usv in per_layer_USV.items():
             rt = int(r_tot.get(layer_key, 0))
             if rt <= 0:
-                meta[layer_key] = {"skip": True, "basis_version": basis_version, "r_tot": 0, "r_main": 0}
+                meta[layer_key] = {"skip": True, "basis_version": basis_version, "r_tot": 0, "r_main": 0,
+                                   "ablation": ablation_mode}
                 continue
             U = usv["U"][:, :rt]
             S = usv["S"][:rt]
-            Vh= usv["Vh"][:rt, :]
-            # LoRA友好因子：B = U * sqrt(S), A = sqrt(S) * V^T
+            Vh = usv["Vh"][:rt, :]
             sroot = torch.sqrt(S)
-            B = (U * sroot.unsqueeze(0))        # [d_out, rt]
-            A = (sroot.unsqueeze(1) * Vh)       # [rt, d_in]
-            # 保存为与本工程一致的 Key 命名
-            # 例："...q_proj.lora_A.local.weight" / "...q_proj.lora_B.local.weight"
+            B = (U * sroot.unsqueeze(0))
+            A = (sroot.unsqueeze(1) * Vh)
             Akey = layer_key + "_A.local.weight"
             Bkey = layer_key + "_B.local.weight"
-            pkg[Akey] = B.float().cpu()  # 注意：我们用B给_A，Vh给_B 与原 distribute_weight_fast 对齐方式保持一致性
-            pkg[Bkey] = A.float().cpu()
-            # Correct A/B placement: ensure lora_A gets A and lora_B gets B
             pkg[Akey] = A.float().cpu()
             pkg[Bkey] = B.float().cpu()
             meta[layer_key] = {
-                "skip": False, "basis_version": basis_version,
-                "r_tot": rt, "r_main": int(r_main.get(layer_key, 0)),
-                "quant_main": quant_main, "quant_res": quant_res
+                "skip": False,
+                "basis_version": basis_version,
+                "r_tot": rt,
+                "r_main": int(r_main.get(layer_key, 0)),
+                "quant_main": quant_main,
+                "quant_res": quant_res,
+                "ablation": ablation_mode,
             }
             del U, S, Vh, B, A
         torch.save(pkg, os.path.join(push_dir, "pytorch_model.bin"))
@@ -305,5 +336,5 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             json.dump(meta, f)
         torch.cuda.empty_cache()
 
-    # 返回聚合的全局 Wg（便于日志/可视化；实际下发已写盘）
     return aggregated
+

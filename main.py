@@ -16,7 +16,7 @@ from peft import (
     prepare_model_for_kbit_training,
 )
 from fed_utils import FedAvg, client_selection, seed_torch, GeneralClient, FlexLoRA, \
-    load_weight_local, distribute_weight_fast, modify_adapter, load_weight_SLoRA, FedHera
+    load_weight_local, distribute_weight_fast, modify_adapter, FedHera
 from fed_utils.model_aggregation import reset_traffic_stats, get_traffic_stats, TRAFFIC_STATS
 
 import datasets
@@ -62,87 +62,45 @@ def build_fixed_rank_map(num_clients):
     return rank_map
 
 
-def build_fedhera_budgets_from_layers(num_clients, hetero_mode, layer_specs, seed=42, fixed_ranks=None):
+def build_fedhera_budgets(num_clients, hetero_mode, seed=42):
     """
-    Compute Fed-Hera client budgets based on LoRA computation.
-
-    The three resource tiers (poor/medium/high) are calibrated so
-    that they can roughly sustain LoRA ranks across all LoRA layers,
-    assuming bfloat16 storage for the main adapter.
+    Return Dict[int]-> {"tier": str, "B_down_MB":float, "VRAM_MB":float, "step_ms":float}
     """
-    # Aggregate per-column costs over LoRA layers.
-    bytes_per_elem_main = 2.0  # bfloat16 main adapter in Fed-Hera.
-    total_bytes_per_col = 0.0
-    total_mem_per_col = 0.0
-    total_time_per_col = 0.0
-    for spec in layer_specs.values():
-        d_out = int(spec["d_out"])
-        d_in = int(spec["d_in"])
-        total_bytes_per_col += (d_out + d_in) * bytes_per_elem_main
-        # Match the cost model used in allocate_r_main_for_client.
-        total_mem_per_col += (d_out + d_in) * 2.0 * 3.5
-        total_time_per_col += 1.0
+    rng = np.random.default_rng(seed)
+    TIERS = {
+        "bandwidth_rich_compute_poor": {"B_down_MB": 220, "VRAM_MB": 8000, "step_ms": 400},
+        "high_resource": {"B_down_MB": 240, "VRAM_MB": 32000, "step_ms": 200},
+        "decoupled": {"B_down_MB": 220, "VRAM_MB": 16000, "step_ms": 260},
+        "low_resource": {"B_down_MB": 120, "VRAM_MB": 8000, "step_ms": 420},
+    }
 
-    MB = 1024.0 * 1024.0
-
-    def tier_for_rank(rank: int):
-        return {
-            "B_down_MB": total_bytes_per_col * rank / MB,
-            "VRAM_MB": total_mem_per_col * rank / MB,
-            "step_ms": total_time_per_col * rank,
-        }
-
-    # Deterministic budgets when a fixed rank map is provided.
-    if fixed_ranks is not None:
-        client_budgets = {}
+    client_budgets = {}
+    if hetero_mode == 'setting_A':
+        base = TIERS["bandwidth_rich_compute_poor"]
         for i in range(num_clients):
-            rank = int(fixed_ranks.get(i, RESOURCE_RANKS["medium"]))
-            base = tier_for_rank(rank)
             client_budgets[i] = {
-                "tier": f"fixed_r{rank}",
+                "tier": "bandwidth_rich_compute_poor",
                 "B_down_MB": float(base["B_down_MB"]),
                 "VRAM_MB": float(base["VRAM_MB"]),
                 "step_ms": float(base["step_ms"]),
             }
         return client_budgets
 
-    rng = np.random.default_rng(seed)
-
-    poor_rank = RESOURCE_RANKS.get("poor", 1)
-    medium_rank = RESOURCE_RANKS.get("medium", 4)
-    high_rank = RESOURCE_RANKS.get("high", 16)
-
-    TIERS = {
-        "poor": tier_for_rank(poor_rank),
-        "medium": tier_for_rank(medium_rank),
-        "high": tier_for_rank(high_rank),
-    }
-
-    # Tier mixing across clients according to hetero_mode.
-    if hetero_mode == 'random':
-        probs = [1 / 3, 1 / 3, 1 / 3]
-    elif hetero_mode == 'normal':
-        probs = [0.25, 0.5, 0.25]
-    else:  # heavy_tail
-        probs = [0.6, 0.3, 0.1]
-    tier_names = ["poor", "medium", "high"]
-
-    client_budgets = {}
+    probs = [0.2, 0.5, 0.3]
+    tier_names = ["high_resource", "decoupled", "low_resource"]
     for i in range(num_clients):
-        tier = rng.choice(tier_names, p=probs)
+        tier = str(rng.choice(tier_names, p=probs))
         base = TIERS[tier]
-        # Per-client randomisation within the chosen tier.
-        f_down = _sample_factor(hetero_mode, rng)
-        f_vram = _sample_factor(hetero_mode, rng)
-        f_step = _sample_factor(hetero_mode, rng)
         client_budgets[i] = {
             "tier": tier,
-            "B_down_MB": float(base["B_down_MB"] * f_down),
-            "VRAM_MB": float(base["VRAM_MB"] * f_vram),
-            "step_ms": float(base["step_ms"] * f_step),
+            "B_down_MB": float(base["B_down_MB"]),
+            "VRAM_MB": float(base["VRAM_MB"]),
+            "step_ms": float(base["step_ms"]),
         }
     return client_budgets
 
+def build_fedhera_budgets_from_layers(num_clients, hetero_mode, layer_specs, seed=42, fixed_ranks=None):
+    return build_fedhera_budgets(num_clients, hetero_mode, seed=seed)
 
 def parse_lora_target_modules(s):
     # Accept JSON list or comma-separated string
@@ -174,15 +132,20 @@ def read_options():
                         help='Enable deterministic CUDA kernels (slower, disables TF32/cuDNN benchmark)')
     parser.add_argument('--device_map', default='cuda', type=str,
                         help='HuggingFace device_map, e.g., "cuda", "auto", or "balanced"')
+    parser.add_argument('--ablation', default=None, type=str,
+                        choices=[None, 'uniform', 'random'],
+                        help='FedHera ablation: None -> water-filling, uniform -> equal ranks, random -> random ranks within budgets')
 
     ## FL parameters
-    parser.add_argument('--aggregation', default='homo', type=str, help = 'aggregation method',
-                        choices = ['homo', 'random', 'heavy_tail', 'heavy_tail_strong', 'normal', 'fedhera'])
-    parser.add_argument('--hetero_mode', default='heavy_tail', type=str,
-                        choices = ['random', 'normal', 'heavy_tail'], help = 'resource heterogeneity mode for Fed-Hera')
+    parser.add_argument('--aggregation', default='homo', type=str,
+                        help='aggregation method',
+                        choices=['homo', 'flexlora', 'fedhera'])
+    parser.add_argument('--hetero_mode', default='setting_B', type=str,
+                        choices=['setting_A', 'setting_B'],
+                        help='resource heterogeneity preset for Fed-Hera/FlexLoRA')
     parser.add_argument('--basis_update_every', default=5, type=int)
     parser.add_argument('--baseline', default='fedavg', type=str,
-                        help='type of FL baselines to choose', choices=['fedavg', 'slora', 'fedit'])
+                        help='type of FL baseline to choose', choices=['fedavg', 'fedit'])
     parser.add_argument('--client_selection_frac', default=0.05, type=float,
                         help='ratio of how many clients participate in each round')
     parser.add_argument('--num_clients', default=1613, type=int,
@@ -236,6 +199,8 @@ def read_options():
                         )
 
     args = parser.parse_args()
+    if isinstance(args.ablation, str) and args.ablation.lower() == "none":
+        args.ablation = None
     return args
 
 
@@ -365,25 +330,22 @@ def resolve_lora_targets_and_config_types(model, user_target_modules=None):
 
 def _resource_probabilities(mode: str):
     """
-    Map hetero mode to (low, medium, high) probabilities.
+    Map hetero mode to (low, medium, high) probabilities for FlexLoRA-style rank sampling.
     """
-    if mode == 'normal':
-        return [0.25, 0.5, 0.25]
-    if mode == 'heavy_tail':
-        return [0.6, 0.3, 0.1]
-    if mode == 'heavy_tail_strong':
-        return [0.2, 0.2, 0.6]
-    # default / random
+    if mode == 'setting_A':
+        return [0.1, 0.3, 0.6]  # mostly high/medium ranks
+    if mode == 'setting_B':
+        return [0.3, 0.5, 0.2]  # 30% low, 50% mid, 20% high
     return [1/3, 1/3, 1/3]
 
 
-def get_peft(config_types, num_clients, strategy=None, hetero_mode="random", seed=42, fixed_ranks=None):
+
+def get_peft(config_types, num_clients, strategy=None, hetero_mode="setting_B", seed=42, fixed_ranks=None):
     """
-    get each client's unique LoRA configuration based on the "aggregation" parameter
+    Get each client's unique LoRA configuration based on the aggregation strategy.
     """
     if strategy in ['homo', 'fedhera']:
         return {'alpha': 16, 'lora_dropout': 0.05}
-    # Use a deterministic rank map when provided to align with Fed-Hera comparisons.
     module_template = next(iter(config_types.values()), {})
     base_modules = list(module_template.keys())
     if fixed_ranks is not None:
@@ -393,8 +355,7 @@ def get_peft(config_types, num_clients, strategy=None, hetero_mode="random", see
             config_local['Client_' + str(i)] = {m: rank for m in base_modules}
         return config_local
     rng = np.random.default_rng(seed)
-    probs = _resource_probabilities(hetero_mode or strategy or "random")
-    # Tie resource tiers directly to ranks: low->Type_0 (rank 4), medium->Type_2 (rank 8), high->Type_1 (rank 16).
+    probs = _resource_probabilities(hetero_mode or "setting_B")
     tier_to_type = {"low": "Type_0", "medium": "Type_2", "high": "Type_1"}
     tiers = ["low", "medium", "high"]
 
@@ -405,84 +366,53 @@ def get_peft(config_types, num_clients, strategy=None, hetero_mode="random", see
         config_local['Client_' + str(i)] = config_types[type_key]
     return config_local
 
+
 def local_client_load_weight(args, model, epoch, global_params=None):
     """
-    load local client's weight
+    Load local client weight for non-FedHera strategies.
     """
-    if args.baseline == 'slora' and epoch != args.R_1:
-        if epoch < args.R_1 or args.aggregation == 'homo':
-            local_weight = global_params
-            _ = model.load_state_dict(local_weight, strict=False)
-        else:
-            local_weight = load_weight_local(global_params, model)
-            _ = model.load_state_dict(local_weight, strict=False)
+    if args.aggregation == 'homo':
+        _ = model.load_state_dict(global_params, strict=False)
     else:
-        if args.aggregation == 'homo':
-            _ = model.load_state_dict(global_params, strict=False)
-        else:
-            local_weight = load_weight_local(global_params, model)
-            _ = model.load_state_dict(local_weight, strict=False)
+        local_weight = load_weight_local(global_params, model)
+        _ = model.load_state_dict(local_weight, strict=False)
+
 
 
 
 def local_client_modify_layer(args, epoch, config_local, model, client_id):
     """
-    Modify local client's LoRA layers based on local config
+    Modify local client's LoRA layers based on local config.
     """
     if args.aggregation == 'fedhera':
         return
     if args.aggregation != 'homo':
-        if args.baseline == 'slora' and epoch >= args.R_1:
-            local_lora_config = config_local['Client_' + str(client_id)]
-            modify_adapter(model, 'local', modify_module_rank=local_lora_config,
-                           lora_alpha=config_local['alpha'], lora_dropout=config_local['lora_dropout'],
-                           init_lora_weights=True)
-        else:
-            local_lora_config = config_local['Client_' + str(client_id)]
-            modify_adapter(model, 'local', modify_module_rank=local_lora_config,
-                           lora_alpha=config_local['alpha'], lora_dropout=config_local['lora_dropout'],
-                           init_lora_weights=True)
+        local_lora_config = config_local['Client_' + str(client_id)]
+        modify_adapter(model, 'local', modify_module_rank=local_lora_config,
+                       lora_alpha=config_local['alpha'], lora_dropout=config_local['lora_dropout'],
+                       init_lora_weights=True)
+
 
 def resume(args, data_path, output_dir, config_local):
     """
-    resume experiment from an existing study
+    Resume experiment from an existing study.
     """
     selected_clients_set = client_selection(args.num_clients, args.client_selection_frac,
                                             seed=args.seed, other_info=args.resume_epoch-1)
-    local_dataset_len_dict = []
+    local_dataset_len_dict = {}
     for client_id in tqdm(selected_clients_set):
         train_path = data_path + '/local_training_' + str(client_id) + '.json'
         train_data = load_dataset("json", data_files=train_path, cache_dir=args.cache_dir)
         local_dataset_len_dict[client_id] = len(train_data['train'])
-    if args.baseline == 'slora':
-        if args.resume_epoch-1 < args.R_1 or args.aggregation == 'fedavg':
-            global_params = FedAvg(selected_clients_set,
-                                   output_dir,
-                                   local_dataset_len_dict,
-                                   args.resume_epoch-1,
-                                   )
-        else:
-            global_params = FlexLoRA(selected_clients_set,
-                                     output_dir,
-                                     local_dataset_len_dict,
-                                     args.resume_epoch-1,
-                                     )
-            global_params = distribute_weight_fast(global_params, config_local)
+    if args.aggregation == 'homo':
+        global_params = FedAvg(selected_clients_set, output_dir, local_dataset_len_dict, args.resume_epoch-1)
+    elif args.aggregation == 'flexlora':
+        global_params = FlexLoRA(selected_clients_set, output_dir, local_dataset_len_dict, args.resume_epoch-1)
+        global_params = distribute_weight_fast(global_params, config_local)
     else:
-        if args.aggregation == 'homo':
-            global_params = FedAvg(selected_clients_set,
-                                   output_dir,
-                                   local_dataset_len_dict,
-                                   args.resume_epoch-1,
-                                   )
-        else:
-            global_params = FlexLoRA(selected_clients_set,
-                                     output_dir,
-                                     local_dataset_len_dict,
-                                     args.resume_epoch-1,
-                                     )
-            global_params = distribute_weight_fast(global_params, config_local)
+        global_params = None
     return global_params
+
 
 def get_density(args, config_local, client_id, config_types):
     """
@@ -504,10 +434,7 @@ def get_density(args, config_local, client_id, config_types):
 
 # training for FL setting
 def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_local, config=None, config_types=None):
-
     logging.info("The process of federated instruction-tuning has started..")
-    # Reset global communication/compute statistics at the beginning
-    # of each training run.
     reset_traffic_stats()
     previously_selected_clients_set = set()
     output_dir = os.path.join(output_dir, str(args.num_clients))
@@ -521,6 +448,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
         start_epoch = args.resume_epoch
     else:
         start_epoch = 0
+        global_params = None
 
     optim = 'sgd' if args.baseline == 'fedavg' else 'adamw_torch'
     for epoch in tqdm(range(start_epoch, args.num_communication_rounds)):
@@ -532,18 +460,11 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
         logging.info("\In Epoch " + str(epoch))
         logging.info("\nConducting the client selection")
 
-        #select participating clients
         selected_clients_set = client_selection(args.num_clients, args.client_selection_frac,
                                                 seed=args.seed, other_info=epoch)
-        if epoch == 15 and args.lr_decay == True:
-            args.local_learning_rate=args.local_learning_rate/2
+        if epoch == 15 and args.lr_decay:
+            args.local_learning_rate = args.local_learning_rate / 2
 
-        if args.baseline == 'slora' and epoch == args.R_1:
-            model, tokenizer = model_and_tokenizer(global_model=args.global_model, device_map=args.device_map)
-            # IMPORTANT: get_peft_model returns a wrapped model; assign it back
-            model = get_peft_model(model, config, adapter_name='local')
-
-        # training for each client
         for k, client_id in enumerate(selected_clients_set):
             train_path = data_path + '/local_training_' + str(client_id) + '.json'
             train_data = load_dataset("json", data_files=train_path, cache_dir=args.cache_dir)
@@ -551,16 +472,13 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             del train_data
             total_data_num += local_dataset_len_dict[client_id]
 
-            # Align this client's LoRA ranks with its resource tier before loading weights.
             local_client_modify_layer(args, epoch, config_local, model, client_id)
 
-            # Fed-Hera: 尝试加载 server_push 包（若本轮生成）
             from fed_utils.adaptive_peft import load_weight_fedhera_if_exists, apply_lora_prefix_mask
             prev_epoch = max(0, epoch - 1)
             pkg, meta = load_weight_fedhera_if_exists(output_dir, client_id, prev_epoch)
-            hera_hooks = None  # Initialize here for each client
+            hera_hooks = None
             if pkg is not None and meta is not None:
-                # 1) 先把每个 base_key (xxx.q_proj.lora) 映射成模块名 (xxx.q_proj)，用于改 LoRA rank
                 per_layer_r_tot = {}
                 for base_key, info in meta.items():
                     if info.get("skip", False):
@@ -568,12 +486,10 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                     rt = int(info.get("r_tot", 0))
                     if rt <= 0:
                         continue
-                    # base_key 形如 "...q_proj.lora" -> 模块名是去掉最后一个 .lora
-                    module_key = base_key.rsplit(".", 1)[0]  # "...q_proj"
+                    module_key = base_key.rsplit(".", 1)[0]
                     per_layer_r_tot[module_key] = rt
 
                 if per_layer_r_tot:
-                    # 2) 真的把对应 LoRA 模块的 rank 调整到 r_tot
                     modify_adapter(
                         model,
                         'local',
@@ -583,10 +499,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                         init_lora_weights=False,
                     )
 
-                # 3) 再加载服务器下发的 A/B 权重，此时形状已经匹配
                 _ = model.load_state_dict(pkg, strict=False)
 
-                # 4) 设置前缀门控，只让前 r_main 列/行参与训练
                 per_layer_r_main = {
                     k: int(v.get("r_main", 0))
                     for k, v in meta.items()
@@ -594,33 +508,21 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 }
                 hera_hooks = apply_lora_prefix_mask(model, per_layer_r_main)
 
-
-            if args.baseline == 'slora' and args.R_1 == epoch:
-                local_weight = load_weight_SLoRA(global_params, model)
-                _ = model.load_state_dict(local_weight, strict=False)
-
             if epoch > 0 and args.aggregation != 'fedhera':
                 local_client_load_weight(args, model, epoch, global_params=global_params)
 
             client = GeneralClient(client_id, model, tokenizer, prompter, data_path, output_dir, cache_dir=args.cache_dir,
-                                   hetero_lora = False, optim = optim, dataloader_num_workers=args.dataloader_num_workers)
+                                   hetero_lora=False, optim=optim, dataloader_num_workers=args.dataloader_num_workers)
 
             logging.info("\nPreparing the local dataset and trainer for Client_{}".format(client_id))
             client.preprare_local_dataset()
 
-            local_eval_result = client.test(epoch,args.local_micro_batch_size)
+            local_eval_result = client.test(epoch, args.local_micro_batch_size)
             local_eval_results += float(local_eval_result['eval_loss']) * local_dataset_len_dict[client_id]
             local_eval_rouge_1 += float(local_eval_result['eval_rouge1']) * local_dataset_len_dict[client_id]
             local_eval_rouge_L += float(local_eval_result['eval_rougeL']) * local_dataset_len_dict[client_id]
 
             logging.info("Initiating the local training of Client_{}".format(client_id))
-
-            if args.baseline == 'slora' and epoch < args.R_1:
-                density = get_density(args, config_local, client_id, config_types)
-                sparse = True
-                client.get_sparse(model, args.local_learning_rate, args.local_micro_batch_size, args.warmup, density)
-            else:
-                sparse = False
 
             client.build_local_trainer(tokenizer,
                                        args.local_micro_batch_size,
@@ -629,7 +531,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                                        args.local_learning_rate,
                                        args.group_by_length,
                                        args.warmup)
-            client.initiate_local_training(sparse)
+            client.initiate_local_training()
 
             logging.info("Local training starts ... ")
             local_train_result = client.train()
@@ -638,7 +540,6 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             logging.info("\nTerminating the local training of Client_{}".format(client_id))
             model, local_dataset_len_dict, previously_selected_clients_set, last_client_id = client.terminate_local_training(
                 epoch, local_dataset_len_dict, previously_selected_clients_set)
-            # Clean up Fed-Hera gradient hooks to avoid accumulation across clients
             if 'hera_hooks' in locals() and hera_hooks is not None:
                 for _h in hera_hooks:
                     try:
@@ -656,7 +557,6 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                                    )
             torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
         elif args.aggregation == 'fedhera':
-            # Fed-Hera: 生成每客户端下发包 + 返回全局Wg（可选保存做日志）
             FedHera(
                 selected_clients_set,
                 output_dir,
@@ -668,6 +568,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 quant_scheme=("bfloat16", "nf4"),
                 use_gpu_svd=True,
                 basis_update_every=args.basis_update_every,
+                ablation=args.ablation,
             )
             # After FedHera aggregation, log per-client ranks and traffic.
             if hasattr(FL_training, "layer_specs"):
@@ -723,8 +624,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 )
             # adapter_model.bin 可存聚合Wg，便于可视化/对照
             # torch.save(_, os.path.join(output_dir, "adapter_model.bin"))
-            
-        else:
+        elif args.aggregation == 'flexlora':
             global_params = FlexLoRA(selected_clients_set,
                                    output_dir,
                                    local_dataset_len_dict,
@@ -732,6 +632,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                                    )
             torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
             global_params = distribute_weight_fast(global_params, config_local)
+        else:
+            raise ValueError(f"Unsupported aggregation mode: {args.aggregation}")
 
         global_eval_rouge_L = local_eval_rouge_L / total_data_num
 
@@ -875,54 +777,6 @@ def main():
     #     model.model_parallel = True
 
     FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_local=config_local, config=config, config_types=config_types)
-
-
-def _sample_factor(mode, rng):
-    if mode == 'random':
-        return rng.uniform(0.8, 1.2)
-    elif mode == 'normal':
-        f = rng.normal(loc=1.0, scale=0.1)
-        return float(np.clip(f, 0.7, 1.3))
-    else:  # heavy_tail
-        f = rng.lognormal(mean=-0.1, sigma=0.5)
-        return float(np.clip(f, 0.5, 2.0))
-
-def build_fedhera_budgets(num_clients, hetero_mode, seed=42):
-    """
-    返回 Dict[int]-> {"tier": str, "B_down_MB":float, "VRAM_MB":float, "step_ms":float}
-    low/medium/high 对应采样频率由 hetero_mode 决定：heavy_tail 偏向 low。
-    """
-    rng = np.random.default_rng(seed)
-    # tier 基线
-    TIERS = {
-        "low":    {"B_down_MB": 80,  "VRAM_MB": 12000, "step_ms": 350},
-        "medium": {"B_down_MB": 140, "VRAM_MB": 20000, "step_ms": 250},
-        "high":   {"B_down_MB": 240, "VRAM_MB": 32000, "step_ms": 200},
-    }
-    # 采样概率
-    if hetero_mode == 'random':
-        probs = [1/3, 1/3, 1/3]
-    elif hetero_mode == 'normal':
-        probs = [0.25, 0.5, 0.25]
-    else:  # heavy_tail -> 弱算力更多
-        probs = [0.6, 0.3, 0.1]
-    tier_names = ["low","medium","high"]
-
-    client_budgets = {}
-    for i in range(num_clients):
-        tier = rng.choice(tier_names, p=probs)
-        base = TIERS[tier]
-        # 对每项资源加入扰动
-        f_down = _sample_factor(hetero_mode, rng)
-        f_vram = _sample_factor(hetero_mode, rng)
-        f_step = _sample_factor(hetero_mode, rng)
-        client_budgets[i] = {
-            "tier": tier,
-            "B_down_MB": float(base["B_down_MB"] * f_down),
-            "VRAM_MB":   float(base["VRAM_MB"]   * f_vram),
-            "step_ms":   float(base["step_ms"]   / max(f_step, 1e-6))  # 算力强→步时更小
-        }
-    return client_budgets
 
 
 if __name__ == "__main__":
