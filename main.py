@@ -145,7 +145,7 @@ def read_options():
     parser.add_argument('--hetero_mode', default='setting_B', type=str,
                         choices=['setting_A', 'setting_B'],
                         help='resource heterogeneity preset for Fed-Hera/FlexLoRA')
-    parser.add_argument('--basis_update_every', default=5, type=int)
+    parser.add_argument('--basis_update_every', default=1, type=int)
     parser.add_argument('--baseline', default='fedavg', type=str,
                         help='type of FL baseline to choose', choices=['fedavg', 'fedit'])
     parser.add_argument('--client_selection_frac', default=0.05, type=float,
