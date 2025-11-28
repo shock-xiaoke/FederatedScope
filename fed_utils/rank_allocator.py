@@ -4,94 +4,102 @@ import numpy as np
 
 def allocate_r_tot_for_client(layers, B_down_bytes, bytes_per_col):
     """
-    下载阶段：对客户端 i 在总下行预算 B_down_bytes 下，
-    以 单位字节收益 = sigma[j]^2 / bytes_per_col[layer] 的前缀增量水位法，得到 r_tot[layer]。
-    layers: Dict[layer_name] -> {"sigma": np.ndarray (desc), "d_out":int, "d_in":int}
-    bytes_per_col: Dict[layer_name] -> int  # (d_out+d_in)*bytes_down
+    Corrected allocation strategy for FedHera download phase.
     """
     r_tot = {L: 0 for L in layers}
     cost_used = 0
-    # Normalise eigenvalues per layer so gains are compared layer-wise.
-    norm_sigma = {}
+    
+    layer_energy = {}
     for L, meta in layers.items():
         sigma = meta.get("sigma", np.array([]))
-        sigma_sq = sigma.astype(float)**2
-        denom = sigma_sq.sum() + 1e-12
-        norm_sigma[L] = sigma_sq / denom
+        layer_energy[L] = sigma.astype(float)**2
 
     while True:
-        best = None
-        for L, meta in layers.items():
+        best_gain = -1.0
+        best_L = None
+        found_candidate = False
+        
+        for L, energy_array in layer_energy.items():
             r = r_tot[L]
-            if r < len(norm_sigma[L]):
-                gain = norm_sigma[L][r] / max(bytes_per_col[L], 1)
-                if (best is None) or (gain > best[0]):
-                    best = (gain, L)
-        if best is None: break
-        _, Lbest = best
-        if cost_used + bytes_per_col[Lbest] > B_down_bytes: break
-        r_tot[Lbest] += 1
-        cost_used += bytes_per_col[Lbest]
+            
+            if r >= len(energy_array):
+                continue
+            
+            cost_increase = bytes_per_col.get(L, 1.0)
+            
+            if cost_used + cost_increase > B_down_bytes:
+                continue 
+            
+            current_energy = energy_array[r]
+            gain = current_energy / max(cost_increase, 1e-9)
+            
+            if gain > best_gain:
+                best_gain = gain
+                best_L = L
+                found_candidate = True
+    
+        if not found_candidate:
+            break
+        
+        r_tot[best_L] += 1
+        cost_used += bytes_per_col.get(best_L, 1.0)
+        
     return r_tot, cost_used
 
 def allocate_r_main_for_client(layers, r_tot, M_bytes, T_ms, c_mem_per_col, c_time_per_col, alpha=None, beta=None):
     """
-    训练阶段：双约束（显存+时间）前缀增量，得到 r_main[layer]（<= r_tot[layer]）。
-    c_mem_per_col: Dict[layer] -> bytes
-    c_time_per_col: Dict[layer] -> ms
+    Fixed allocation strategy for FedHera.
     """
     r_main = {L: 0 for L in layers}
-    M_left, T_left = M_bytes, T_ms
-
-    # Normalise eigenvalues per layer so we rank by relative (within-layer) importance.
-    norm_sigma = {}
+    M_left, T_left = float(M_bytes), float(T_ms)
+    
+    layer_energy_map = {}
     for L, meta in layers.items():
         sigma = meta.get("sigma", np.array([]))
         sigma_sq = sigma.astype(float)**2
-        denom = sigma_sq.sum() + 1e-12
-        norm_sigma[L] = sigma_sq / denom
-
-    # Reserve a minimum per layer so r_tot - r_main <= 2 whenever budgets allow.
-    for L, rt in r_tot.items():
-        target_min = max(rt - 2, 0)
-        capped_target = min(target_min, len(norm_sigma[L]))
-        while r_main[L] < capped_target:
-            if (M_left < c_mem_per_col[L]) or (T_left < c_time_per_col[L]):
-                break
-            r_main[L] += 1
-            M_left -= c_mem_per_col[L]
-            T_left -= c_time_per_col[L]
+        layer_energy_map[L] = sigma_sq
 
     while True:
-        invT = 1.0 / max(T_left/T_ms, 1e-9)
-        invM = 1.0 / max(M_left/M_bytes, 1e-9)
+        current_T_ratio = max(T_left, 1e-9) / max(T_ms, 1e-9)
+        current_M_ratio = max(M_left, 1e-9) / max(M_bytes, 1e-9)
+        
+        invT = 1.0 / current_T_ratio
+        invM = 1.0 / current_M_ratio
 
-        a = (invT / invT + invM) if alpha is None else alpha
-        b = (invM / invT + invM) if beta  is None else beta
+        # 【Fix 3: 修复括号优先级错误】
+        sum_inv = invT + invM
+        a = (invT / sum_inv) if alpha is None else alpha
+        b = (invM / sum_inv) if beta  is None else beta
+
         best = None
-        for L, meta in layers.items():
+        
+        for L, sigma_sq in layer_energy_map.items():
             r = r_main[L]
-            if r >= min(r_tot[L], len(norm_sigma[L])):
+            limit = min(r_tot.get(L, 0), len(sigma_sq))
+            
+            if r >= limit:
                 continue
-            unit_cost = a * c_time_per_col[L] + b * c_mem_per_col[L]
-            gain = norm_sigma[L][r] / max(unit_cost, 1e-9)
-            if (best is None) or (gain > best[0]):
-                best = (gain, L)
-        if best is None: break
-        _, Lbest = best
-        if (M_left < c_mem_per_col[Lbest]) or (T_left < c_time_per_col[Lbest]):
-            break
-        r_main[Lbest] += 1
-        M_left -= c_mem_per_col[Lbest]
-        T_left -= c_time_per_col[Lbest]
 
-    # Ensure r_main is close to r_tot: r_tot - r_main <= 2 when resources allow.
-    for L, rt in r_tot.items():
-        target_min = max(rt - 2, 0)
-        while r_main[L] < target_min:
-            if (M_left < c_mem_per_col[L]) or (T_left < c_time_per_col[L]):
-                break
-            r_main[L] += 1
-            M_left -= c_mem_per_col[L]
-            T_left -= c_time_per_col[L]
+            cost_t = c_time_per_col.get(L, 1.0)
+            cost_m = c_mem_per_col.get(L, 1.0)
+            
+            if (M_left < cost_m) or (T_left < cost_t):
+                continue
+
+            unit_cost = a * cost_t + b * cost_m
+            
+            gain = sigma_sq[r] / max(unit_cost, 1e-12)
+
+            if (best is None) or (gain > best[0]):
+                best = (gain, L, cost_m, cost_t)
+
+        if best is None:
+            break
+
+        _, Lbest, cost_m, cost_t = best
+        
+        r_main[Lbest] += 1
+        M_left -= cost_m
+        T_left -= cost_t
+
     return r_main, (M_bytes - M_left), (T_ms - T_left)
