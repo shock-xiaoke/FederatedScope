@@ -152,9 +152,9 @@ class GeneralClient:
 
         try:
             from bitsandbytes.optim import Adam8bit
-            optimizer = Adam8bit(lora_params, lr=local_learning_rate)
+            optimizer = Adam8bit(lora_params, lr=local_learning_rate, weight_decay=0.0)
         except Exception:
-            optimizer = torch.optim.AdamW(lora_params, lr=local_learning_rate)
+            optimizer = torch.optim.AdamW(lora_params, lr=local_learning_rate, weight_decay=0.0)
 
         steps_per_epoch = max(1, len(self.local_train_dataset) // max(1, local_micro_batch_size))
         update_steps_per_epoch = max(1, steps_per_epoch // max(1, gradient_accumulation_steps))
