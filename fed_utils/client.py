@@ -84,31 +84,38 @@ class GeneralClient:
         ddp = False
 
         def compute_metrics(pred):
-            labels_ids = np.array(pred.label_ids)
-            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-            labels_ids = np.where(labels_ids == -100, pad_id, labels_ids)
-            pred_ids = np.argmax(pred.predictions, axis=-1)
-            pred_str = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-            label_str = self.tokenizer.batch_decode(labels_ids, skip_special_tokens=True)
+            # 获取 Logits 和 Labels
+            logits = pred.predictions
+            # 如果 logits 是 tuple (比如包含 past_key_values)，取第一个元素
+            if isinstance(logits, tuple):
+                logits = logits[0]
 
-            def _norm(x): return x.strip().lower()
+            labels_ids = pred.label_ids
 
-            correct = 0
-            for p, l in zip(pred_str, label_str):
-                p_n = _norm(p)
-                l_n = _norm(l)
-                if p_n == l_n or l_n in p_n:
-                    correct += 1
-            accuracy = correct / max(1, len(label_str))
+            # Argmax 获取预测的 Token ID [Batch, Seq_Len]
+            pred_ids = np.argmax(logits, axis=-1)
 
-            rouge = evaluate.load('./evaluate/metrics/rouge/rouge.py')
-            rouge_output = rouge.compute(predictions=pred_str, references=label_str, use_aggregator=True)
+            # -----------------------------------------------------------
+            # 【关键修复】Shift 操作：对齐预测和标签
+            # Causal LM 中，位置 t 的 Logit 预测的是 t+1 的 Label
+            # -----------------------------------------------------------
+            shift_preds = pred_ids[:, :-1]  # 预测值截掉最后一位
+            shift_labels = labels_ids[:, 1:]  # 标签值截掉第一位
+
+            # 创建掩码：忽略 padding 和 label 为 -100 的部分
+            # pad_token_id 通常也是 -100 (在 DataCollator 中处理过) 或者 tokenizer.pad_token_id
+            mask = (shift_labels != -100)
+
+            # 计算 Token-level Accuracy
+            # 只有在 mask 为 True 的位置才计算是否相等
+            matches = (shift_preds == shift_labels) & mask
+            correct = matches.sum()
+            total_valid_tokens = mask.sum()
+
+            accuracy = correct / max(1, total_valid_tokens)
+
             return {
-                'rouge1': round(rouge_output["rouge1"], 4),
-                'rouge2': round(rouge_output["rouge2"], 4),
-                'rougeL': round(rouge_output["rougeL"], 4),
-                'rougeLsum': round(rouge_output["rougeLsum"], 4),
-                'accuracy': round(accuracy, 4),
+                'accuracy': round(float(accuracy), 4),
             }
 
         use_cuda = torch.cuda.is_available()
