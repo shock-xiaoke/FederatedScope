@@ -102,6 +102,67 @@ def build_fedhera_budgets(num_clients, hetero_mode, seed=42):
 def build_fedhera_budgets_from_layers(num_clients, hetero_mode, layer_specs, seed=42, fixed_ranks=None):
     return build_fedhera_budgets(num_clients, hetero_mode, seed=seed)
 
+def calculate_unified_rank_from_budget(client_budgets, layer_specs, max_rank=64):
+    """
+    根据通信预算(B_down_MB)和计算/时间预算(step_ms)计算每个客户端的统一Rank。
+    公式参考 FedHera 的代价模型：
+      Comm Cost = r * sum(d_in + d_out) * 2 bytes
+      Time Cost = r * num_layers * 1.0 (简化模型)
+    """
+    rank_map = {}
+    
+    # 1. 计算 LoRA 每增加秩 r=1 带来的参数量总和 (sum of d_in + d_out)
+    total_dim_sum = 0
+    num_layers = 0
+    for key, spec in layer_specs.items():
+        d_in = spec.get('d_in')
+        d_out = spec.get('d_out')
+        if d_in is not None and d_out is not None:
+            total_dim_sum += (d_in + d_out)
+            num_layers += 1
+            
+    if total_dim_sum == 0:
+        # 异常兜底
+        return {i: 8 for i in client_budgets.keys()}
+
+    # 2. 定义单位代价
+    # 通信：FP16/BF16 下，每个参数 2 字节
+    MB = 1024 * 1024
+    bytes_per_unit_rank = total_dim_sum * 2.0 
+    
+    # 计算：FedHera 中假设每列的时间代价为 1.0 (heuristic)，即总时间 = r * num_layers * 1.0
+    # 如果你的预算 step_ms 是指“允许的总计算步数”，则 r_max = step_ms / num_layers
+    time_cost_per_unit_rank = float(num_layers)
+
+    for client_id, budget in client_budgets.items():
+        # 获取预算
+        b_down = budget.get("B_down_MB", 200)
+        step_ms = budget.get("step_ms", 400)
+        
+        # 3. 计算基于通信的 Rank 上限
+        # B_down * MB >= r * bytes_per_unit_rank
+        r_comm = int((b_down * MB) / bytes_per_unit_rank)
+        
+        # 4. 计算基于计算能力的 Rank 上限
+        # step_ms >= r * time_cost_per_unit_rank
+        if time_cost_per_unit_rank > 0:
+            r_comp = int(step_ms / time_cost_per_unit_rank)
+        else:
+            r_comp = max_rank
+
+        # 5. 取两者最小值 (木桶效应)
+        final_r = min(r_comm, r_comp)
+        
+        # 限制范围，防止过大或过小
+        final_r = max(1, min(final_r, max_rank))
+        
+        rank_map[client_id] = final_r
+        
+        # (可选) 打印一下分配结果以便调试
+        # print(f"Client {client_id}: Comm_R={r_comm}, Comp_R={r_comp} -> Final={final_r}")
+        
+    return rank_map
+
 def parse_lora_target_modules(s):
     # Accept JSON list or comma-separated string
     try:
@@ -195,7 +256,7 @@ def read_options():
     parser.add_argument('--lora_dropout', default=0.05, type=float,
                         help='LoRA dropout')
     parser.add_argument('--lora_target_modules',
-                        default=['q_proj', 'v_proj'],
+                        default=['q_proj', 'k_proj', 'v_proj'],
                         type=parse_lora_target_modules,
                         help='lora_target_modules (JSON list or comma-separated)',
                         )
@@ -701,10 +762,62 @@ def main():
     model, tokenizer = model_and_tokenizer(global_model=args.global_model, device_map=args.device_map)
 
     prompter = Prompter(args.prompt_template_name)
+
+    # 1. 无论什么方法，先提取模型层信息 (layer_specs)，用于后续计算开销
+    layer_specs = {}
+    for name, param in model.named_parameters():
+        if "lora_A" in name or "lora_B" in name:
+            base_key = '.'.join(name.split('.')[:-3]) + '.lora'
+            if base_key not in layer_specs:
+                if "lora_A" in name:
+                    r, d_in = param.shape
+                    layer_specs[base_key] = {"d_out": None, "d_in": int(d_in)}
+                else:
+                    d_out, r = param.shape
+                    if base_key not in layer_specs:
+                        layer_specs[base_key] = {"d_out": int(d_out), "d_in": None}
+                    else:
+                        layer_specs[base_key]["d_out"] = int(d_out)
+    
+    # 补全可能缺失的维度信息
+    for k, v in layer_specs.items():
+        if v["d_out"] is None or v["d_in"] is None:
+            for name, p in model.named_parameters():
+                if k in name:
+                    if v["d_out"] is None and "lora_B" in name:
+                        v["d_out"] = int(p.shape[0])
+                    if v["d_in"] is None and "lora_A" in name:
+                        v["d_in"] = int(p.shape[1])
+
+    # 2. 生成客户端资源预算 (client_budgets)
+    # 这将根据 setting_A 或 setting_B 分配 B_down_MB, step_ms 等
+    client_budgets = build_fedhera_budgets_from_layers(
+        args.num_clients,
+        args.hetero_mode,
+        layer_specs,
+        seed=args.seed,
+    )
     # For FedHera, respect setting_A/setting_B budgets (no fixed ranks); other modes keep deterministic ranks.
     if args.aggregation == 'fedhera':
         fixed_ranks = None
+    elif args.aggregation == 'flexlora':
+        # [关键修改] 使用预算计算 Rank，而不是 build_fixed_rank_map
+        logging.info("Calculating FlexLoRA ranks based on client budgets...")
+        fixed_ranks = calculate_unified_rank_from_budget(client_budgets, layer_specs)
+    elif args.aggregation == 'homo':
+        # [修改点] Homo: 找到所有客户端中 Rank 最小的那个值，赋给所有人
+        if not raw_budget_ranks:
+            min_rank = 4 # 兜底默认值
+        else:
+            min_rank = min(raw_budget_ranks.values())
+            
+        logging.info(f"Homo: Bottleneck detected. Setting unified rank to {min_rank} for all clients.")
+        
+        # 构造一个全员统一的 Rank Map
+        fixed_ranks = {i: min_rank for i in range(args.num_clients)}
+        
     else:
+        # 其他情况（如原来的 baseline）使用默认逻辑
         fixed_ranks = build_fixed_rank_map(args.num_clients)
 
     # Choose model-appropriate LoRA target modules and heterogeneity configs.
