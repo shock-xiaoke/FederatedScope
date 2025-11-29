@@ -168,7 +168,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             use_gpu_svd=False,
             basis_update_every=5,
             fixed_client_ranks=None,
-            ablation=None):
+            ablation=None,
+            lora_alpha=16):
     """
     Fed-Hera aggregation:
     1) Merge client adapters into W_global.
@@ -258,6 +259,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     bytes_down_main = BYTE_MAP.get(quant_main, 2.0)
     MB = 1024.0 * 1024.0
     rng = np.random.default_rng()
+    round_transmit_bytes = 0.0
+    round_compute_bytes = 0.0
 
     for client_id in selected_clients_set:
         budgets = client_budgets[int(client_id)]
@@ -314,6 +317,9 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             U = usv["U"][:, :rt]
             S = usv["S"][:rt]
             Vh = usv["Vh"][:rt, :]
+            # Pre-scale the singular values so that (B@A)*(alpha/rt) matches W_svd on the client.
+            scale_up = float(rt) / float(max(lora_alpha, 1e-12))
+            S = S * scale_up
             sroot = torch.sqrt(S)
             B = (U * sroot.unsqueeze(0))
             A = (sroot.unsqueeze(1) * Vh)
@@ -335,6 +341,51 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
         with open(os.path.join(push_dir, "meta.json"), "w") as f:
             json.dump(meta, f)
         torch.cuda.empty_cache()
+
+        # Track communication/compute stats for this client based on the written meta.
+        client_transmit_bytes = 0.0
+        client_compute_bytes = 0.0
+        rank_summary = {}
+        for layer_key, info in meta.items():
+            if info.get("skip", False):
+                continue
+            rt = int(info.get("r_tot", 0))
+            rm = int(info.get("r_main", 0))
+            rank_summary[layer_key] = {"r_tot": rt, "r_main": rm}
+
+            d_out = d_in = None
+            if layer_specs and layer_key in layer_specs:
+                spec = layer_specs[layer_key]
+                d_out = spec.get("d_out")
+                d_in = spec.get("d_in")
+            # Fallback to shapes from the stored tensors if specs are missing.
+            if (d_out is None or d_in is None) and pkg:
+                Akey = layer_key + "_A.local.weight"
+                Bkey = layer_key + "_B.local.weight"
+                if d_out is None and Bkey in pkg:
+                    d_out = int(pkg[Bkey].shape[0])
+                if d_in is None and Akey in pkg:
+                    d_in = int(pkg[Akey].shape[1])
+            if d_out is None or d_in is None:
+                continue
+
+            bytes_per_rank = (d_out + d_in) * bytes_down_main
+            client_transmit_bytes += bytes_per_rank * rt
+            client_compute_bytes += bytes_per_rank * rm
+
+        if rank_summary:
+            logging.info("[FedHera][epoch %d][client %s] ranks=%s", epoch, str(client_id), rank_summary)
+        round_transmit_bytes += client_transmit_bytes
+        round_compute_bytes += client_compute_bytes
+
+    TRAFFIC_STATS["FedHera"]["transmit_MB"] += round_transmit_bytes / MB
+    TRAFFIC_STATS["FedHera"]["compute_MB"] += round_compute_bytes / MB
+    logging.info(
+        "[FedHera][epoch %d] round_transmit_MB=%.3f round_compute_MB=%.3f",
+        epoch,
+        round_transmit_bytes / MB,
+        round_compute_bytes / MB,
+    )
 
     return aggregated
 

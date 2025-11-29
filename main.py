@@ -62,17 +62,22 @@ def build_fixed_rank_map(num_clients):
     return rank_map
 
 
-def build_fedhera_budgets(num_clients, hetero_mode, seed=42):
+def get_client_budgets(num_clients, hetero_mode, seed=42):
     """
-    Return Dict[int]-> {"tier": str, "B_down_MB":float, "VRAM_MB":float, "step_ms":float}
+    Hardcoded per-client resource budgets used for all aggregation methods.
+    setting_A is homogeneous and calibrated so B_down~40MB and step_ms~800
+    yield roughly r_comm~64 and r_comp~16 on Mistral-7B-scale models.
     """
     rng = np.random.default_rng(seed)
     TIERS = {
-        # Increased budgets to let setting_A sustain ~r_comm=100 and ~r_comp=16 on Mistral-7B.
-        "bandwidth_rich_compute_poor": {"B_down_MB": 660, "VRAM_MB": 12000, "step_ms": 800},
-        "high_resource": {"B_down_MB": 720, "VRAM_MB": 48000, "step_ms": 400},
-        "decoupled": {"B_down_MB": 660, "VRAM_MB": 24000, "step_ms": 520},
-        "low_resource": {"B_down_MB": 360, "VRAM_MB": 12000, "step_ms": 840},
+        # Communication-light but slower compute: ~64 comm rank, ~16 compute rank (Mistral-7B).
+        "bandwidth_rich_compute_poor": {"B_down_MB": 40.0, "VRAM_MB": 24000.0, "step_ms": 800.0},
+        # Balanced/stronger hardware.
+        "high_resource": {"B_down_MB": 96.0, "VRAM_MB": 48000.0, "step_ms": 520.0},
+        # Plenty of bandwidth, moderate compute.
+        "decoupled": {"B_down_MB": 72.0, "VRAM_MB": 32000.0, "step_ms": 720.0},
+        # Constrained clients.
+        "low_resource": {"B_down_MB": 32.0, "VRAM_MB": 16000.0, "step_ms": 1200.0},
     }
 
     client_budgets = {}
@@ -87,7 +92,7 @@ def build_fedhera_budgets(num_clients, hetero_mode, seed=42):
             }
         return client_budgets
 
-    probs = [0.2, 0.5, 0.3]
+    probs = [0.2, 0.5, 0.30]
     tier_names = ["high_resource", "decoupled", "low_resource"]
     for i in range(num_clients):
         tier = str(rng.choice(tier_names, p=probs))
@@ -99,9 +104,6 @@ def build_fedhera_budgets(num_clients, hetero_mode, seed=42):
             "step_ms": float(base["step_ms"]),
         }
     return client_budgets
-
-def build_fedhera_budgets_from_layers(num_clients, hetero_mode, layer_specs, seed=42, fixed_ranks=None):
-    return build_fedhera_budgets(num_clients, hetero_mode, seed=seed)
 
 def extract_lora_layer_specs(model):
     """
@@ -133,9 +135,9 @@ def extract_lora_layer_specs(model):
 
 def calculate_unified_rank_from_budget(client_budgets, layer_specs, max_rank=64):
     """
-    Derive per-client ranks from the shared communication/computation budgets.
-    Comm cost per rank: sum(d_in + d_out) * bytes_per_param.
-    Compute cost per rank: scaled by total LoRA parameter count.
+    Derive per-client ranks from shared communication/computation budgets.
+    Unit costs are calibrated so that a setting_A client with B_down~40MB and
+    step_ms~800 yields r_comm~64 and r_comp~16 on Mistral-7B-style models.
     """
     rank_map = {}
 
@@ -150,14 +152,13 @@ def calculate_unified_rank_from_budget(client_budgets, layer_specs, max_rank=64)
     if total_dim_sum == 0:
         return {client_id: 8 for client_id in client_budgets.keys()}
 
-    # Communication cost assumes bf16 (2 bytes per parameter).
     MB = 1024 * 1024
-    bytes_per_unit_rank = total_dim_sum * 2.0
+    # NF4-ish download with some overhead to hit the target r_comm.
+    bytes_per_param = 0.8
+    bytes_per_unit_rank = total_dim_sum * bytes_per_param
 
-    # Approximate compute cost: scale LoRA parameter count to ms.
-    # Calibrated so that a setting_A client (step_ms ~800) on Mistral-7B
-    # can sustain roughly 16 ranks.
-    compute_ms_per_param = 1.8e-05
+    # Approximate compute cost calibrated for Mistral-7B.
+    compute_ms_per_param = 6.0e-05
     time_cost_per_unit_rank = total_dim_sum * compute_ms_per_param
 
     for client_id, budget in client_budgets.items():
@@ -642,59 +643,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 use_gpu_svd=True,
                 basis_update_every=args.basis_update_every,
                 ablation=args.ablation,
+                lora_alpha=args.lora_alpha,
             )
-            # After FedHera aggregation, log per-client ranks and traffic.
-            if hasattr(FL_training, "layer_specs"):
-                round_transmit_bytes = 0.0
-                round_compute_bytes = 0.0
-                MB = 1024.0 * 1024.0
-                for client_id in selected_clients_set:
-                    push_dir = os.path.join(output_dir, str(client_id), f"server_push_epoch_{epoch}")
-                    meta_path = os.path.join(push_dir, "meta.json")
-                    if not os.path.exists(meta_path):
-                        continue
-                    try:
-                        with open(meta_path, "r") as f:
-                            meta = json.load(f)
-                    except Exception:
-                        continue
-                    client_transmit_bytes = 0.0
-                    client_compute_bytes = 0.0
-                    rank_summary = {}
-                    for layer_key, info in meta.items():
-                        rt = int(info.get("r_tot", 0))
-                        rm = int(info.get("r_main", 0))
-                        rank_summary[layer_key] = {"r_tot": rt, "r_main": rm}
-                        spec = FL_training.layer_specs.get(layer_key)
-                        if spec is None:
-                            continue
-                        d_out = int(spec["d_out"])
-                        d_in = int(spec["d_in"])
-                        bytes_per_rank = (d_out + d_in) * 2.0  # bfloat16 main adapter
-                        if rt > 0:
-                            client_transmit_bytes += bytes_per_rank * rt
-                        if rm > 0:
-                            client_compute_bytes += bytes_per_rank * rm
-
-                    if rank_summary:
-                        logging.info(
-                            "[FedHera][epoch %d][client %s] ranks=%s",
-                            epoch,
-                            str(client_id),
-                            rank_summary,
-                        )
-
-                    round_transmit_bytes += client_transmit_bytes
-                    round_compute_bytes += client_compute_bytes
-
-                TRAFFIC_STATS["FedHera"]["transmit_MB"] += round_transmit_bytes / MB
-                TRAFFIC_STATS["FedHera"]["compute_MB"] += round_compute_bytes / MB
-                logging.info(
-                    "[FedHera][epoch %d] round_transmit_MB=%.3f round_compute_MB=%.3f",
-                    epoch,
-                    round_transmit_bytes / MB,
-                    round_compute_bytes / MB,
-                )
             # adapter_model.bin 可存聚合Wg，便于可视化/对照
             # torch.save(_, os.path.join(output_dir, "adapter_model.bin"))
         elif args.aggregation == 'flexlora':
@@ -774,13 +724,8 @@ def main():
 
     # Build layer specs and budgets once for all aggregation strategies.
     layer_specs = extract_lora_layer_specs(model)
-    client_budgets = build_fedhera_budgets_from_layers(
-        args.num_clients,
-        args.hetero_mode,
-        layer_specs,
-        seed=args.seed,
-    )
-    raw_budget_ranks = calculate_unified_rank_from_budget(client_budgets, layer_specs)
+    client_budgets = get_client_budgets(args.num_clients, args.hetero_mode, seed=args.seed)
+    calculated_ranks = calculate_unified_rank_from_budget(client_budgets, layer_specs)
     FL_training.layer_specs = layer_specs
     FL_training.client_budgets = client_budgets
 
@@ -788,13 +733,13 @@ def main():
         fixed_ranks = None
     elif args.aggregation == 'flexlora':
         logging.info("Calculating FlexLoRA ranks based on client budgets...")
-        fixed_ranks = raw_budget_ranks
+        fixed_ranks = calculated_ranks
     elif args.aggregation == 'homo':
-        min_rank = min(raw_budget_ranks.values()) if raw_budget_ranks else 1
+        min_rank = min(calculated_ranks.values()) if calculated_ranks else 1
         logging.info(f"Homo: Bottleneck detected. Setting unified rank to {min_rank} for all clients.")
         fixed_ranks = {i: min_rank for i in range(args.num_clients)}
     else:
-        fixed_ranks = build_fixed_rank_map(args.num_clients)
+        raise ValueError(f"Unsupported aggregation method: {args.aggregation}")
     # Choose model-appropriate LoRA target modules and heterogeneity configs.
     lora_target_modules, config_types = resolve_lora_targets_and_config_types(
         model,
