@@ -128,21 +128,25 @@ def calculate_unified_rank_from_budget(client_budgets, layer_specs, max_rank=64)
         return {client_id: 8 for client_id in client_budgets.keys()}
 
     MB = 1024 * 1024
-    # NF4-ish download with some overhead to hit the target r_comm.
-    bytes_per_param = 0.8
+    # NF4-ish download with conservative overhead to align setting_A near rank~16.
+    bytes_per_param = 2.2
     bytes_per_unit_rank = total_dim_sum * bytes_per_param
 
-    # Approximate compute cost calibrated so that setting_A (~1600 ms step time)
-    # yields r_comp ≈ 16 on Mistral/LLaMA-scale models targeting q/k/v.
-    compute_ms_per_param = 1.25e-04
+    # Approximate compute cost calibrated so that setting_A (~1600 ms) yields r_comp ~16.
+    compute_ms_per_param = 3.5e-04
     time_cost_per_unit_rank = total_dim_sum * compute_ms_per_param
 
+    first_client_debug = True
     for client_id, budget in client_budgets.items():
         b_down = float(budget.get("B_down_MB", 0.0))
         step_ms = float(budget.get("step_ms", 0.0))
 
         r_comm = int((b_down * MB) / bytes_per_unit_rank) if bytes_per_unit_rank > 0 else max_rank
         r_comp = int(step_ms / time_cost_per_unit_rank) if time_cost_per_unit_rank > 0 else max_rank
+
+        if first_client_debug:
+            print(f"[RankDebug] client {client_id}: r_comm={r_comm} r_comp={r_comp}")
+            first_client_debug = False
 
         final_r = max(1, min(max_rank, min(r_comm, r_comp)))
         rank_map[client_id] = final_r
