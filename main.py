@@ -71,7 +71,7 @@ def get_client_budgets(num_clients, hetero_mode, seed=42):
     rng = np.random.default_rng(seed)
     TIERS = {
         # Communication-light but slower compute: ~64 comm rank, ~16 compute rank (Mistral-7B).
-        "bandwidth_rich_compute_poor": {"B_down_MB": 40.0, "VRAM_MB": 24000.0, "step_ms": 800.0},
+        "bandwidth_rich_compute_poor": {"B_down_MB": 40.0, "VRAM_MB": 48000.0, "step_ms": 1600.0},
         # Balanced/stronger hardware.
         "high_resource": {"B_down_MB": 96.0, "VRAM_MB": 48000.0, "step_ms": 520.0},
         # Plenty of bandwidth, moderate compute.
