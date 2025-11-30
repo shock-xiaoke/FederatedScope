@@ -129,7 +129,7 @@ def calculate_unified_rank_from_budget(client_budgets, layer_specs, max_rank=64)
 
     MB = 1024 * 1024
     # NF4-ish download with conservative overhead to align setting_A near rank~16.
-    bytes_per_param = 2.3
+    bytes_per_param = 2.2
     bytes_per_unit_rank = total_dim_sum * bytes_per_param
 
     # Approximate compute cost calibrated so that setting_A (~1600 ms) yields r_comp ~16.
