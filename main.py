@@ -133,7 +133,7 @@ def calculate_unified_rank_from_budget(client_budgets, layer_specs, max_rank=64)
     bytes_per_unit_rank = total_dim_sum * bytes_per_param
 
     # Approximate compute cost calibrated so that setting_A (~1600 ms) yields r_comp ~16.
-    compute_ms_per_param = 2.2e-04
+    compute_ms_per_param = 2.0e-04
     time_cost_per_unit_rank = total_dim_sum * compute_ms_per_param
 
     first_client_debug = True
