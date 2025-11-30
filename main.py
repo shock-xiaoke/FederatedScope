@@ -132,8 +132,9 @@ def calculate_unified_rank_from_budget(client_budgets, layer_specs, max_rank=64)
     bytes_per_param = 0.8
     bytes_per_unit_rank = total_dim_sum * bytes_per_param
 
-    # Approximate compute cost calibrated for Mistral-7B.
-    compute_ms_per_param = 6.0e-05
+    # Approximate compute cost calibrated so that setting_A (~1600 ms step time)
+    # yields r_comp ≈ 16 on Mistral/LLaMA-scale models targeting q/k/v.
+    compute_ms_per_param = 1.25e-04
     time_cost_per_unit_rank = total_dim_sum * compute_ms_per_param
 
     for client_id, budget in client_budgets.items():
