@@ -45,21 +45,6 @@ RESOURCE_RANKS = {
     "high": 16,
 }
 
-# Deterministic client rank map for comparability.
-def build_fixed_rank_map(num_clients):
-    rank_map = {}
-    for i in range(num_clients):
-        if 0 <= i <= 4:
-            rank = 4
-        elif 5 <= i <= 14:
-            rank = 8
-        elif 15 <= i <= 19:
-            rank = 16
-        else:
-            # Default to the medium tier for any additional clients.
-            rank = RESOURCE_RANKS["medium"]
-        rank_map[i] = rank
-    return rank_map
 
 
 def get_client_budgets(num_clients, hetero_mode, seed=42):
@@ -105,32 +90,22 @@ def get_client_budgets(num_clients, hetero_mode, seed=42):
         }
     return client_budgets
 
-def extract_lora_layer_specs(model):
+def extract_lora_layer_specs(model, target_modules):
     """
-    Collect LoRA layer (d_out, d_in) pairs keyed by the shared base name.
+    Estimate LoRA layer (d_out, d_in) pairs from base model modules that will
+    receive adapters.
     """
     layer_specs = {}
-    for name, param in model.named_parameters():
-        if "lora_A" in name or "lora_B" in name:
-            base_key = '.'.join(name.split('.')[:-3]) + '.lora'
-            if base_key not in layer_specs:
-                layer_specs[base_key] = {"d_out": None, "d_in": None}
-            if "lora_A" in name:
-                _, d_in = param.shape
-                layer_specs[base_key]["d_in"] = int(d_in)
-            else:
-                d_out, _ = param.shape
-                layer_specs[base_key]["d_out"] = int(d_out)
-
-    # Fill missing dimensions when only one side of the adapter was seen.
-    for key, spec in layer_specs.items():
-        if spec["d_out"] is None or spec["d_in"] is None:
-            for name, param in model.named_parameters():
-                if key in name:
-                    if spec["d_out"] is None and "lora_B" in name:
-                        spec["d_out"] = int(param.shape[0])
-                    if spec["d_in"] is None and "lora_A" in name:
-                        spec["d_in"] = int(param.shape[1])
+    targets = tuple(target_modules or [])
+    for name, module in model.named_modules():
+        if not targets or not any(str(name).endswith(t) for t in targets):
+            continue
+        weight = getattr(module, "weight", None)
+        if weight is None or not hasattr(weight, "shape") or len(weight.shape) < 2:
+            continue
+        d_out, d_in = int(weight.shape[0]), int(weight.shape[1])
+        base_key = f"base_model.model.{name}.lora"  # Mirror PEFT naming consumed downstream.
+        layer_specs[base_key] = {"d_out": d_out, "d_in": d_in}
     return layer_specs
 
 def calculate_unified_rank_from_budget(client_budgets, layer_specs, max_rank=64):
@@ -229,7 +204,7 @@ def read_options():
                         help='Parameter for SLoRA. Total number of rounds for stage 1 sparse finetuning.')
     parser.add_argument('--early_stop', default=True, type=bool,
                         help='Early stop for FL training. If True, will apply early stop.')
-    parser.add_argument('--patience', default=3, type=int,
+    parser.add_argument('--patience', default=10, type=int,
                         help='Early stop patience.')
     parser.add_argument('--resume_epoch', default=None, type=int,
                         help='continue training from an existing experiment, specifying which comm round to resume')
@@ -722,8 +697,14 @@ def main():
 
     prompter = Prompter(args.prompt_template_name)
 
+    # Choose model-appropriate LoRA target modules and heterogeneity configs.
+    lora_target_modules, config_types = resolve_lora_targets_and_config_types(
+        model,
+        user_target_modules=args.lora_target_modules,
+    )
+
     # Build layer specs and budgets once for all aggregation strategies.
-    layer_specs = extract_lora_layer_specs(model)
+    layer_specs = extract_lora_layer_specs(model, lora_target_modules)
     client_budgets = get_client_budgets(args.num_clients, args.hetero_mode, seed=args.seed)
     calculated_ranks = calculate_unified_rank_from_budget(client_budgets, layer_specs)
     FL_training.layer_specs = layer_specs
@@ -740,11 +721,6 @@ def main():
         fixed_ranks = {i: min_rank for i in range(args.num_clients)}
     else:
         raise ValueError(f"Unsupported aggregation method: {args.aggregation}")
-    # Choose model-appropriate LoRA target modules and heterogeneity configs.
-    lora_target_modules, config_types = resolve_lora_targets_and_config_types(
-        model,
-        user_target_modules=args.lora_target_modules,
-    )
     config_local = get_peft(
         config_types,
         num_clients=args.num_clients,
