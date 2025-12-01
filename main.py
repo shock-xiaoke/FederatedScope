@@ -65,7 +65,7 @@ def get_client_budgets(num_clients, hetero_mode, seed=42):
     TIERS_B = {
         "strong": {"B_down_MB": 96.0, "VRAM_MB": 48000.0, "step_ms": 520.0},
         # Plenty of bandwidth, moderate compute.
-        "decoupled": {"B_down_MB": 72.0, "VRAM_MB": 32000.0, "step_ms": 720.0},
+        "decoupled": {"B_down_MB": 64.0, "VRAM_MB": 32000.0, "step_ms": 720.0},
         # Constrained clients.
         "weak": {"B_down_MB": 32.0, "VRAM_MB": 16000.0, "step_ms": 1200.0},
     }

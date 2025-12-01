@@ -122,6 +122,62 @@ def _to_fedhera_example_gsm8k(example: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _to_fedhera_example_svamp(example: Dict[str, Any]) -> Dict[str, Any]:
+    """Map SVAMP arithmetic reasoning examples."""
+    body = example.get("Body") or example.get("body") or ""
+    question = example.get("Question") or example.get("question") or ""
+    inp = f"{body}\nQuestion: {question}".strip()
+    answer = example.get("Answer") or example.get("answer") or ""
+    instruction = "Solve the following arithmetic problem and provide the answer."
+    return {
+        "instruction": instruction,
+        "input": inp,
+        "output": answer,
+        "category": "SVAMP",
+    }
+
+
+def _to_fedhera_example_boolq(example: Dict[str, Any]) -> Dict[str, Any]:
+    """Map BoolQ reading comprehension examples."""
+    passage = example.get("passage") or ""
+    question = example.get("question") or ""
+    inp = f"Passage: {passage}\nQuestion: {question}?"
+    raw_answer = example.get("answer")
+    if isinstance(raw_answer, str):
+        ans_lower = raw_answer.lower()
+        answer = "True" if ans_lower in {"true", "yes", "1"} else "False"
+    else:
+        answer = "True" if raw_answer else "False"
+    instruction = "Read the passage and answer the question with True or False."
+    return {
+        "instruction": instruction,
+        "input": inp,
+        "output": answer,
+        "category": "BoolQ",
+    }
+
+
+def _to_fedhera_example_piqa(example: Dict[str, Any]) -> Dict[str, Any]:
+    """Map PIQA physical commonsense examples."""
+    goal = example.get("goal") or ""
+    sol1 = example.get("sol1") or ""
+    sol2 = example.get("sol2") or ""
+    label = example.get("label")
+    try:
+        label = int(label)
+    except Exception:
+        label = None
+    correct = sol1 if label == 0 else sol2 if label == 1 else ""
+    inp = f"Goal: {goal}\nSolution 1: {sol1}\nSolution 2: {sol2}"
+    instruction = "Given a goal and two solutions, identify the correct one."
+    return {
+        "instruction": instruction,
+        "input": inp,
+        "output": correct,
+        "category": "PIQA",
+    }
+
+
 def _to_fedhera_example_hellaswag(example: Dict[str, Any]) -> Dict[str, Any]:
     """Map HellaSwag examples to a multiple-choice style prompt."""
     ctx_a = example.get("ctx_a") or ""
@@ -258,6 +314,12 @@ def preprocess_task(
         mapper = _to_fedhera_example_e2e
     elif task == "gsm8k":
         mapper = _to_fedhera_example_gsm8k
+    elif task == "svamp":
+        mapper = _to_fedhera_example_svamp
+    elif task == "boolq":
+        mapper = _to_fedhera_example_boolq
+    elif task == "piqa":
+        mapper = _to_fedhera_example_piqa
     elif task == "hellaswag":
         mapper = _to_fedhera_example_hellaswag
     else:
@@ -280,7 +342,16 @@ def parse_args() -> argparse.Namespace:
         "--task",
         type=str,
         required=True,
-        choices=["metamathqa", "commonsense", "e2e_nlg", "gsm8k", "hellaswag"],
+        choices=[
+            "metamathqa",
+            "commonsense",
+            "e2e_nlg",
+            "gsm8k",
+            "svamp",
+            "boolq",
+            "piqa",
+            "hellaswag",
+        ],
         help="Which task to preprocess.",
     )
     parser.add_argument(
