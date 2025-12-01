@@ -56,18 +56,30 @@ def get_client_budgets(num_clients, hetero_mode, seed=42):
     rng = np.random.default_rng(seed)
     # Setting A (homogeneous) stays as originally calibrated.
     TIERS_A = {
-        "bandwidth_rich_compute_poor": {"B_down_MB": 40.0, "VRAM_MB": 48000.0, "step_ms": 1600.0},
+        "bandwidth_rich_compute_poor": {"B_down_MB": 96.0, "VRAM_MB": 32000.0, "step_ms": 800.0},
     }
     # Setting B (heterogeneous) emphasises decoupled clients:
     # - weak: low bandwidth + low compute (constrains both methods)
     # - decoupled: high bandwidth (~r_tot 64+) but low compute (~r_main 8)
     # - strong: high bandwidth + high compute
     TIERS_B = {
-        "strong": {"B_down_MB": 96.0, "VRAM_MB": 48000.0, "step_ms": 520.0},
-        # Plenty of bandwidth, moderate compute.
-        "decoupled": {"B_down_MB": 64.0, "VRAM_MB": 32000.0, "step_ms": 720.0},
-        # Constrained clients.
-        "weak": {"B_down_MB": 32.0, "VRAM_MB": 16000.0, "step_ms": 1200.0},
+        "strong": {
+        "B_down_MB": 96.0,
+        "VRAM_MB":   48000.0,
+        "step_ms":   1600.0,   # 最大时间预算
+        },
+        # decoupled：高带宽 + 低算力
+        "decoupled": {
+            "B_down_MB": 64.0,
+            "VRAM_MB":   32000.0,
+            "step_ms":   800.0,    # 比 strong 小很多
+        },
+        # 弱：低带宽 + 低算力
+        "weak": {
+            "B_down_MB": 32.0,
+            "VRAM_MB":   16000.0,
+            "step_ms":   400.0,    # 最小时间预算
+        },
     }
 
     client_budgets = {}
@@ -392,7 +404,7 @@ def _resource_probabilities(mode: str):
     Map hetero mode to (low, medium, high) probabilities for FlexLoRA-style rank sampling.
     """
     if mode == 'setting_A':
-        return [0.1, 0.3, 0.6]  # mostly high/medium ranks
+        return [1/3, 1/3, 1/3]  # mostly high/medium ranks
     if mode == 'setting_B':
         return [0.3, 0.5, 0.2]  # 30% low, 50% mid, 20% high
     return [1/3, 1/3, 1/3]

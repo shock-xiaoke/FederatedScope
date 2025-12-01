@@ -288,7 +288,9 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             layers[layer_key] = {"sigma": sigma, "d_out": d_out, "d_in": d_in}
             bytes_per_col[layer_key] = int((d_out + d_in) * bytes_down_main)
             c_mem_per_col[layer_key] = int((d_out + d_in) * 2.0 * 3.5)
-            c_time_per_col[layer_key] = 1.0
+            compute_ms_per_param = 1.7e-04  # 与 main.py 里的数保持同步
+            # 每个 rank 的时间成本 ≈ (d_out + d_in) * compute_ms_per_param
+            c_time_per_col[layer_key] = float((d_out + d_in) * compute_ms_per_param)
 
         if ablation == "uniform":
             r_tot, r_main = _uniform_allocation(layers, bytes_per_col, c_mem_per_col, c_time_per_col,
