@@ -218,7 +218,6 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
 
     with torch.no_grad():
         aggregated = {}
-        coverage = {}
         for k, client_id in tqdm(enumerate(selected_clients_set)):
             single_output = os.path.join(output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin")
             state = torch.load(single_output, map_location="cpu")
@@ -233,13 +232,6 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                         aggregated[base_key] = merged.clone().to('cpu')
                     else:
                         aggregated[base_key] += merged.to('cpu')
-                    # Track how much weight contributed to each singular direction.
-                    if base_key not in coverage:
-                        coverage[base_key] = torch.zeros(rank, dtype=torch.float32)
-                    elif coverage[base_key].shape[0] < rank:
-                        pad = torch.zeros(rank - coverage[base_key].shape[0], dtype=torch.float32)
-                        coverage[base_key] = torch.cat([coverage[base_key], pad], dim=0)
-                    coverage[base_key][:rank] += weights_array[k]
             del state
             torch.cuda.empty_cache()
 
@@ -251,23 +243,11 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
         device = "cuda" if (use_gpu_svd and torch.cuda.is_available()) else "cpu"
         W = Wg.to(device=device, dtype=torch.float32)
         U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-        # Correct singular values by the rank coverage to avoid high-rank decay.
-        cov = coverage.get(layer_key, torch.tensor([], dtype=torch.float32))
-        max_rank = min(Wg.shape[0], Wg.shape[1])
-        if cov.shape[0] < max_rank:
-            cov = torch.cat([cov, torch.zeros(max_rank - cov.shape[0], dtype=torch.float32)], dim=0)
-        elif cov.shape[0] > max_rank:
-            cov = cov[:max_rank]
-        cov = cov.to(device=device, dtype=S.dtype)
-        S_corrected = S.clone()
-        valid = cov > 1e-12
-        if valid.any():
-            S_corrected = torch.where(valid, S_corrected / cov, S_corrected)
         per_layer_USV[layer_key] = {
             "U": U.to("cpu"),
-            "S": S_corrected.to("cpu"),
+            "S": S.to("cpu"),
             "Vh": Vh.to("cpu"),
-            "sigma": S_corrected.detach().cpu().numpy(),
+            "sigma": S.detach().cpu().numpy(),
         }
         del Wg, W, U, S, Vh
         torch.cuda.empty_cache()

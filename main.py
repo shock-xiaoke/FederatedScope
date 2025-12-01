@@ -54,20 +54,25 @@ def get_client_budgets(num_clients, hetero_mode, seed=42):
     yield roughly r_comm~64 and r_comp~16 on Mistral-7B-scale models.
     """
     rng = np.random.default_rng(seed)
-    TIERS = {
-        # Communication-light but slower compute: ~64 comm rank, ~16 compute rank (Mistral-7B).
+    # Setting A (homogeneous) stays as originally calibrated.
+    TIERS_A = {
         "bandwidth_rich_compute_poor": {"B_down_MB": 40.0, "VRAM_MB": 48000.0, "step_ms": 1600.0},
-        # Balanced/stronger hardware.
-        "high_resource": {"B_down_MB": 96.0, "VRAM_MB": 48000.0, "step_ms": 520.0},
+    }
+    # Setting B (heterogeneous) emphasises decoupled clients:
+    # - weak: low bandwidth + low compute (constrains both methods)
+    # - decoupled: high bandwidth (~r_tot 64+) but low compute (~r_main 8)
+    # - strong: high bandwidth + high compute
+    TIERS_B = {
+        "strong": {"B_down_MB": 96.0, "VRAM_MB": 48000.0, "step_ms": 520.0},
         # Plenty of bandwidth, moderate compute.
         "decoupled": {"B_down_MB": 72.0, "VRAM_MB": 32000.0, "step_ms": 720.0},
         # Constrained clients.
-        "low_resource": {"B_down_MB": 32.0, "VRAM_MB": 16000.0, "step_ms": 1200.0},
+        "weak": {"B_down_MB": 32.0, "VRAM_MB": 16000.0, "step_ms": 1200.0},
     }
 
     client_budgets = {}
     if hetero_mode == 'setting_A':
-        base = TIERS["bandwidth_rich_compute_poor"]
+        base = TIERS_A["bandwidth_rich_compute_poor"]
         for i in range(num_clients):
             client_budgets[i] = {
                 "tier": "bandwidth_rich_compute_poor",
@@ -77,11 +82,12 @@ def get_client_budgets(num_clients, hetero_mode, seed=42):
             }
         return client_budgets
 
-    probs = [0.2, 0.5, 0.30]
-    tier_names = ["high_resource", "decoupled", "low_resource"]
+    # setting_B: heavy emphasis on decoupled clients.
+    probs = [0.3, 0.5, 0.2]
+    tier_names = ["weak", "decoupled", "strong"]
     for i in range(num_clients):
         tier = str(rng.choice(tier_names, p=probs))
-        base = TIERS[tier]
+        base = TIERS_B[tier]
         client_budgets[i] = {
             "tier": tier,
             "B_down_MB": float(base["B_down_MB"]),
@@ -133,7 +139,7 @@ def calculate_unified_rank_from_budget(client_budgets, layer_specs, max_rank=64)
     bytes_per_unit_rank = total_dim_sum * bytes_per_param
 
     # Approximate compute cost calibrated so that setting_A (~1600 ms) yields r_comp ~16.
-    compute_ms_per_param = 1.72e-04
+    compute_ms_per_param = 1.7e-04
     time_cost_per_unit_rank = total_dim_sum * compute_ms_per_param
 
     first_client_debug = True
