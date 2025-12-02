@@ -476,9 +476,23 @@ def resume(args, data_path, output_dir, config_local):
         train_data = load_dataset("json", data_files=train_path, cache_dir=args.cache_dir)
         local_dataset_len_dict[client_id] = len(train_data['train'])
     if args.aggregation == 'homo':
-        global_params = FedAvg(selected_clients_set, output_dir, local_dataset_len_dict, args.resume_epoch-1)
+        global_params = FedAvg(
+            selected_clients_set,
+            output_dir,
+            local_dataset_len_dict,
+            args.resume_epoch-1,
+            client_budgets=FL_training.client_budgets,
+            layer_specs=FL_training.layer_specs,
+        )
     elif args.aggregation == 'flexlora':
-        global_params = FlexLoRA(selected_clients_set, output_dir, local_dataset_len_dict, args.resume_epoch-1)
+        global_params = FlexLoRA(
+            selected_clients_set,
+            output_dir,
+            local_dataset_len_dict,
+            args.resume_epoch-1,
+            client_budgets=FL_training.client_budgets,
+            layer_specs=FL_training.layer_specs,
+        )
         global_params = distribute_weight_fast(global_params, config_local)
     else:
         global_params = None
@@ -625,6 +639,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                                    output_dir,
                                    local_dataset_len_dict,
                                    epoch,
+                                   client_budgets=FL_training.client_budgets,
+                                   layer_specs=FL_training.layer_specs,
                                    )
             if args.save_model:
                 torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
@@ -650,6 +666,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                                    output_dir,
                                    local_dataset_len_dict,
                                    epoch,
+                                   client_budgets=FL_training.client_budgets,
+                                   layer_specs=FL_training.layer_specs,
                                    )
             if args.save_model:
                 torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))

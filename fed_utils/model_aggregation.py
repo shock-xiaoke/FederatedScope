@@ -29,7 +29,7 @@ def get_traffic_stats():
     }
 
 
-def FedAvg(selected_clients_set, output_dir, local_dataset_len_dict, epoch):
+def FedAvg(selected_clients_set, output_dir, local_dataset_len_dict, epoch, client_budgets=None, layer_specs=None):
     weights_array = normalize(
         torch.tensor([local_dataset_len_dict[client_id] for client_id in selected_clients_set],
                      dtype=torch.float32),
@@ -52,6 +52,40 @@ def FedAvg(selected_clients_set, output_dir, local_dataset_len_dict, epoch):
             weighted_single_weights = {key: weighted_single_weights[key] + single_weights[key] * (weights_array[k])
                                        for key in
                                        single_weights.keys()}
+        if client_budgets is not None:
+            budget = client_budgets.get(int(client_id)) if isinstance(client_budgets, dict) else None
+            if budget is not None:
+                comm_bytes = 0.0
+                comp_time_ms = 0.0
+                for key in list(single_weights.keys()):
+                    if 'local' not in key or 'bias' in key or 'lora_A' not in key:
+                        continue
+                    B_key = key.replace('lora_A', 'lora_B')
+                    if B_key not in single_weights:
+                        continue
+                    A_w = single_weights[key]
+                    B_w = single_weights[B_key]
+                    rank = int(B_w.shape[1])
+                    base_key = '.'.join(key.split('.')[:-3]) + '.lora'
+                    d_out = int(B_w.shape[0])
+                    d_in = int(A_w.shape[1]) if A_w.ndim >= 2 else int(A_w.shape[-1])
+                    if layer_specs is not None and base_key in layer_specs:
+                        spec = layer_specs[base_key]
+                        d_out = int(spec.get("d_out", d_out))
+                        d_in = int(spec.get("d_in", d_in))
+                    comm_bytes += float(rank * (d_in + d_out) * 2.0)
+                    comp_time_ms += float(rank * (d_in + d_out) * 1.7e-04)
+                B_down_bytes = float(budget.get("B_down_MB", 0.0)) * 1024.0 * 1024.0
+                T_ms = float(budget.get("step_ms", 0.0))
+                comm_util = (comm_bytes / B_down_bytes) if B_down_bytes > 0 else 0.0
+                comp_util = (comp_time_ms / T_ms) if T_ms > 0 else 0.0
+                logging.info(
+                    "[FedAvg][epoch %d][client %s] Comm Util: %.1f%%, Comp Util: %.1f%%",
+                    epoch,
+                    str(client_id),
+                    comm_util * 100.0,
+                    comp_util * 100.0,
+                )
         del single_weights
         gc.collect()
         torch.cuda.empty_cache()
@@ -93,7 +127,7 @@ def truncate(selected_clients_set, output_dir, local_dataset_len_dict, epoch, ha
     torch.cuda.empty_cache()
     return weighted_single_weights
 
-def FlexLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch):
+def FlexLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch, client_budgets=None, layer_specs=None):
     """
     Aggregate heterogeneous LoRA adapters from clients.
 
@@ -110,9 +144,13 @@ def FlexLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch):
 
     round_transmit_bytes = 0.0
     round_compute_bytes = 0.0
+    compute_ms_per_param = 1.7e-04
+    MB = 1024.0 * 1024.0
 
     with torch.no_grad():
         for k, client_id in tqdm(enumerate(selected_clients_set)):
+            comm_bytes = 0.0
+            comp_time_ms = 0.0
             single_output_dir = os.path.join(
                 output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin"
             )
@@ -135,6 +173,14 @@ def FlexLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch):
                     bytes_this = (d_in + d_out) * rank * elem_bytes
                     round_transmit_bytes += bytes_this
                     round_compute_bytes += bytes_this  # same for FlexLoRA
+                    # Track per-client comm/comp usage
+                    base_key = '.'.join(key.split('.')[:-3]) + '.lora'
+                    if layer_specs is not None and base_key in layer_specs:
+                        spec = layer_specs[base_key]
+                        d_out = int(spec.get("d_out", d_out))
+                        d_in = int(spec.get("d_in", d_in))
+                    comm_bytes += float(rank * (d_in + d_out) * 2.0)
+                    comp_time_ms += float(rank * (d_in + d_out) * compute_ms_per_param)
 
                     del merged_weight
                     torch.cuda.empty_cache()
@@ -142,7 +188,21 @@ def FlexLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch):
             # gc.collect()
             torch.cuda.empty_cache()
 
-    MB = 1024.0 * 1024.0
+            if client_budgets is not None:
+                budget = client_budgets.get(int(client_id)) if isinstance(client_budgets, dict) else None
+                if budget is not None:
+                    B_down_bytes = float(budget.get("B_down_MB", 0.0)) * MB
+                    T_ms = float(budget.get("step_ms", 0.0))
+                    comm_util = (comm_bytes / B_down_bytes) if B_down_bytes > 0 else 0.0
+                    comp_util = (comp_time_ms / T_ms) if T_ms > 0 else 0.0
+                    logging.info(
+                        "[FlexLoRA][epoch %d][client %s] Comm Util: %.1f%%, Comp Util: %.1f%%",
+                        epoch,
+                        str(client_id),
+                        comm_util * 100.0,
+                        comp_util * 100.0,
+                    )
+
     TRAFFIC_STATS["FlexLoRA"]["transmit_MB"] += round_transmit_bytes / MB
     TRAFFIC_STATS["FlexLoRA"]["compute_MB"] += round_compute_bytes / MB
     logging.info(
@@ -177,6 +237,7 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     3) Allocate r_tot/r_main per client (water-filling or ablation).
     4) Push truncated A/B plus meta (r_main) back to clients.
     """
+    compute_ms_per_param = 1.7e-04
     def _uniform_allocation(layers, bytes_per_col, c_mem_per_col, c_time_per_col,
                             B_down_bytes, M_bytes, T_ms, target_rank=None):
         total_bytes = max(sum(bytes_per_col.values()), 1)
@@ -347,6 +408,7 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
         # Track communication/compute stats for this client based on the written meta.
         client_transmit_bytes = 0.0
         client_compute_bytes = 0.0
+        comp_time_ms = 0.0
         rank_summary = {}
         for layer_key, info in meta.items():
             if info.get("skip", False):
@@ -384,9 +446,19 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             bytes_per_rank = (d_out + d_in) * elem_bytes
             client_transmit_bytes += bytes_per_rank * rt
             client_compute_bytes += bytes_per_rank * rm
+            comp_time_ms += float(rm * (d_in + d_out) * compute_ms_per_param)
 
         if rank_summary:
             logging.info("[FedHera][epoch %d][client %s] ranks=%s", epoch, str(client_id), rank_summary)
+        comm_util = (client_transmit_bytes / float(B_down_bytes)) if B_down_bytes > 0 else 0.0
+        comp_util = (comp_time_ms / float(T_ms)) if T_ms > 0 else 0.0
+        logging.info(
+            "[FedHera][epoch %d][client %s] Comm Util: %.1f%%, Comp Util: %.1f%%",
+            epoch,
+            str(client_id),
+            comm_util * 100.0,
+            comp_util * 100.0,
+        )
         round_transmit_bytes += client_transmit_bytes
         round_compute_bytes += client_compute_bytes
 
