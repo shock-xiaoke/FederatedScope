@@ -171,10 +171,11 @@ def calculate_unified_rank_from_budget(client_budgets, layer_specs, max_rank=64)
 
     return rank_map
 
-def calculate_active_layers_from_budget(client_budgets, layer_specs, lora_rank, comp_cost_per_layer=1.0):
+def calculate_active_layers_from_budget(client_budgets, layer_specs, lora_rank):
     """
     Estimate how many LoRA layers each client can actively train under
     Fed-HeLLo based on bandwidth and step-time budgets.
+    Uses the same per-parameter compute cost as calculate_unified_rank_from_budget.
     """
     layer_specs = layer_specs or {}
     total_layers = len(layer_specs)
@@ -191,7 +192,7 @@ def calculate_active_layers_from_budget(client_budgets, layer_specs, lora_rank, 
 
     avg_params_per_layer = float(np.mean(params_per_layer)) if params_per_layer else 0.0
     comm_cost_per_layer = avg_params_per_layer * 2.0  # BF16 bytes per param
-    comp_cost_per_layer = float(comp_cost_per_layer)
+    comp_cost_per_layer = avg_params_per_layer * 1.7e-04  # ms per layer scaled by params
     MB = 1024 * 1024
 
     num_active_layers = {}
