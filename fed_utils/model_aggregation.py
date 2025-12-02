@@ -435,13 +435,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
 
             Akey = layer_key + "_A.local.weight"
             Bkey = layer_key + "_B.local.weight"
-            elem_bytes = None
-            if Akey in pkg:
-                elem_bytes = pkg[Akey].element_size()
-            elif Bkey in pkg:
-                elem_bytes = pkg[Bkey].element_size()
-            if elem_bytes is None:
-                elem_bytes = bytes_down_main
+            # Use the quantized main precision for accounting to match budgets.
+            elem_bytes = bytes_down_main
 
             bytes_per_rank = (d_out + d_in) * elem_bytes
             client_transmit_bytes += bytes_per_rank * rt
