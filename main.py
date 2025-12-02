@@ -16,7 +16,7 @@ from peft import (
     prepare_model_for_kbit_training,
 )
 from fed_utils import FedAvg, client_selection, seed_torch, GeneralClient, FlexLoRA, \
-    load_weight_local, distribute_weight_fast, modify_adapter, FedHera
+    load_weight_local, distribute_weight_fast, modify_adapter, FedHera, FedHeLLo
 from fed_utils.model_aggregation import reset_traffic_stats, get_traffic_stats, TRAFFIC_STATS
 
 import datasets
@@ -171,6 +171,41 @@ def calculate_unified_rank_from_budget(client_budgets, layer_specs, max_rank=64)
 
     return rank_map
 
+def calculate_active_layers_from_budget(client_budgets, layer_specs, lora_rank, comp_cost_per_layer=1.0):
+    """
+    Estimate how many LoRA layers each client can actively train under
+    Fed-HeLLo based on bandwidth and step-time budgets.
+    """
+    layer_specs = layer_specs or {}
+    total_layers = len(layer_specs)
+    if total_layers == 0:
+        return {}, 0.0
+
+    params_per_layer = []
+    for _, spec in layer_specs.items():
+        d_in = spec.get("d_in")
+        d_out = spec.get("d_out")
+        if d_in is None or d_out is None:
+            continue
+        params_per_layer.append((d_in + d_out) * lora_rank)
+
+    avg_params_per_layer = float(np.mean(params_per_layer)) if params_per_layer else 0.0
+    comm_cost_per_layer = avg_params_per_layer * 2.0  # BF16 bytes per param
+    comp_cost_per_layer = float(comp_cost_per_layer)
+    MB = 1024 * 1024
+
+    num_active_layers = {}
+    for client_id, budget in client_budgets.items():
+        b_down_bytes = float(budget.get("B_down_MB", 0.0)) * MB
+        step_ms = float(budget.get("step_ms", 0.0))
+        l_comm = (b_down_bytes / comm_cost_per_layer) if comm_cost_per_layer > 0 else total_layers
+        l_comp = (step_ms / comp_cost_per_layer) if comp_cost_per_layer > 0 else total_layers
+        count = int(min(l_comm, l_comp))
+        count = max(1, min(total_layers, count))
+        num_active_layers[int(client_id)] = count
+
+    return num_active_layers, avg_params_per_layer
+
 def parse_lora_target_modules(s):
     # Accept JSON list or comma-separated string
     try:
@@ -210,7 +245,7 @@ def read_options():
     ## FL parameters
     parser.add_argument('--aggregation', default='homo', type=str,
                         help='aggregation method',
-                        choices=['homo', 'flexlora', 'fedhera'])
+                        choices=['homo', 'flexlora', 'fedhera', 'fedhello'])
     parser.add_argument('--hetero_mode', default='setting_B', type=str,
                         choices=['setting_A', 'setting_B'],
                         help='resource heterogeneity preset for Fed-Hera/FlexLoRA')
@@ -415,7 +450,7 @@ def get_peft(config_types, num_clients, strategy=None, hetero_mode="setting_B", 
     """
     Get each client's unique LoRA configuration based on the aggregation strategy.
     """
-    if strategy in ['homo', 'fedhera']:
+    if strategy in ['homo', 'fedhera', 'fedhello']:
         return {'alpha': 16, 'lora_dropout': 0.05}
     module_template = next(iter(config_types.values()), {})
     base_modules = list(module_template.keys())
@@ -442,7 +477,7 @@ def local_client_load_weight(args, model, epoch, global_params=None):
     """
     Load local client weight for non-FedHera strategies.
     """
-    if args.aggregation == 'homo':
+    if args.aggregation in ['homo', 'fedhello']:
         _ = model.load_state_dict(global_params, strict=False)
     else:
         local_weight = load_weight_local(global_params, model)
@@ -455,7 +490,7 @@ def local_client_modify_layer(args, epoch, config_local, model, client_id):
     """
     Modify local client's LoRA layers based on local config.
     """
-    if args.aggregation == 'fedhera':
+    if args.aggregation in ['fedhera', 'fedhello']:
         return
     if args.aggregation != 'homo':
         local_lora_config = config_local['Client_' + str(client_id)]
@@ -536,6 +571,10 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
         global_params = None
 
     optim = 'sgd' if args.baseline == 'fedavg' else 'adamw_torch'
+    fedhello_layer_keys = sorted(FL_training.layer_specs.keys()) if args.aggregation == 'fedhello' else []
+    fedhello_active_counts = FL_training.fedhello_active_layer_counts if args.aggregation == 'fedhello' else {}
+    if fedhello_active_counts is None:
+        fedhello_active_counts = {}
     for epoch in tqdm(range(start_epoch, args.num_communication_rounds)):
         local_train_results = 0
         local_eval_results = 0
@@ -549,6 +588,21 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                                                 seed=args.seed, other_info=epoch)
         if epoch == 15 and args.lr_decay:
             args.local_learning_rate = args.local_learning_rate / 2
+
+        fedhello_masks = None
+        if args.aggregation == 'fedhello':
+            fedhello_masks = {}
+            rng = np.random.default_rng(args.seed + epoch)
+            total_layers = len(fedhello_layer_keys)
+            for client_id in selected_clients_set:
+                active_count = int(fedhello_active_counts.get(int(client_id), 1))
+                if total_layers > 0:
+                    active_count = max(1, min(total_layers, active_count))
+                    chosen = rng.choice(fedhello_layer_keys, size=active_count, replace=False)
+                    active_layers = [str(x) for x in chosen]
+                else:
+                    active_layers = []
+                fedhello_masks[client_id] = active_layers
 
         for k, client_id in enumerate(selected_clients_set):
             train_path = data_path + '/local_training_' + str(client_id) + '.json'
@@ -596,8 +650,12 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             if epoch > 0 and args.aggregation != 'fedhera':
                 local_client_load_weight(args, model, epoch, global_params=global_params)
 
+            active_layers = None
+            if fedhello_masks is not None:
+                active_layers = fedhello_masks.get(client_id, [])
             client = GeneralClient(client_id, model, tokenizer, prompter, data_path, output_dir, cache_dir=args.cache_dir,
-                                   hetero_lora=False, optim=optim, dataloader_num_workers=args.dataloader_num_workers)
+                                   hetero_lora=False, optim=optim, dataloader_num_workers=args.dataloader_num_workers,
+                                   active_lora_layers=active_layers)
 
             logging.info("\nPreparing the local dataset and trainer for Client_{}".format(client_id))
             client.preprare_local_dataset()
@@ -661,6 +719,18 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             )
             # adapter_model.bin 可存聚合Wg，便于可视化/对照
             # torch.save(_, os.path.join(output_dir, "adapter_model.bin"))
+        elif args.aggregation == 'fedhello':
+            global_params = FedHeLLo(
+                selected_clients_set,
+                output_dir,
+                local_dataset_len_dict,
+                epoch,
+                active_layers_map=fedhello_masks,
+                prev_global_params=global_params,
+                layer_specs=FL_training.layer_specs,
+            )
+            if args.save_model:
+                torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
         elif args.aggregation == 'flexlora':
             global_params = FlexLoRA(selected_clients_set,
                                    output_dir,
@@ -750,6 +820,20 @@ def main():
     calculated_ranks = calculate_unified_rank_from_budget(client_budgets, layer_specs)
     FL_training.layer_specs = layer_specs
     FL_training.client_budgets = client_budgets
+    if args.aggregation == 'fedhello':
+        fedhello_counts, avg_params = calculate_active_layers_from_budget(
+            client_budgets, layer_specs, args.lora_r
+        )
+        FL_training.fedhello_active_layer_counts = fedhello_counts
+        FL_training.fedhello_avg_params_per_layer = avg_params
+        logging.info(
+            "[FedHeLLo] avg_params_per_layer=%.1f num_active_layers_sample=%s",
+            avg_params,
+            dict(list(fedhello_counts.items())[:3]),
+        )
+    else:
+        FL_training.fedhello_active_layer_counts = None
+        FL_training.fedhello_avg_params_per_layer = None
 
     if args.aggregation == 'fedhera':
         fixed_ranks = None
@@ -760,6 +844,8 @@ def main():
         min_rank = min(calculated_ranks.values()) if calculated_ranks else 1
         logging.info(f"Homo: Bottleneck detected. Setting unified rank to {min_rank} for all clients.")
         fixed_ranks = {i: min_rank for i in range(args.num_clients)}
+    elif args.aggregation == 'fedhello':
+        fixed_ranks = None
     else:
         raise ValueError(f"Unsupported aggregation method: {args.aggregation}")
     config_local = get_peft(

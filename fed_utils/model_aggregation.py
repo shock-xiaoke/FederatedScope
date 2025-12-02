@@ -12,6 +12,7 @@ from tqdm import tqdm
 TRAFFIC_STATS = {
     "FlexLoRA": {"transmit_MB": 0.0, "compute_MB": 0.0},
     "FedHera": {"transmit_MB": 0.0, "compute_MB": 0.0},
+    "FedHeLLo": {"transmit_MB": 0.0, "compute_MB": 0.0},
 }
 
 
@@ -93,6 +94,68 @@ def FedAvg(selected_clients_set, output_dir, local_dataset_len_dict, epoch, clie
     # set_peft_model_state_dict(model, weighted_single_weights, "default")
     torch.cuda.empty_cache()
     return weighted_single_weights
+
+def FedHeLLo(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
+             active_layers_map=None, prev_global_params=None, layer_specs=None):
+    """
+    Layer-wise aggregation for Fed-HeLLo that averages only over clients
+    that trained each LoRA layer.
+    """
+    del local_dataset_len_dict  # unused but kept for API symmetry
+    layer_counts = {}
+    accum = {}
+    round_transmit_bytes = 0.0
+    MB = 1024.0 * 1024.0
+    total_layers = len(layer_specs or {})
+
+    with torch.no_grad():
+        for client_id in selected_clients_set:
+            single_output_dir = os.path.join(
+                output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin"
+            )
+            if not os.path.exists(single_output_dir):
+                continue
+            state = torch.load(single_output_dir, map_location="cpu")
+            active_layers = set(active_layers_map.get(client_id, [])) if active_layers_map else None
+            updated_layers = set()
+            for key, tensor in state.items():
+                base_key = '.'.join(key.split('.')[:-3]) + '.lora'
+                if active_layers is not None and base_key not in active_layers:
+                    continue
+                updated_layers.add(base_key)
+                if key not in accum:
+                    accum[key] = torch.zeros_like(tensor)
+                accum[key] += tensor
+                round_transmit_bytes += float(tensor.numel() * tensor.element_size())
+            for base_key in updated_layers:
+                layer_counts[base_key] = layer_counts.get(base_key, 0) + 1
+            del state
+            torch.cuda.empty_cache()
+
+    aggregated = {}
+    if prev_global_params is not None:
+        aggregated.update({
+            k: v.clone() if isinstance(v, torch.Tensor) else v
+            for k, v in prev_global_params.items()
+        })
+
+    for key, summed in accum.items():
+        base_key = '.'.join(key.split('.')[:-3]) + '.lora'
+        count = layer_counts.get(base_key, 0)
+        if count > 0:
+            aggregated[key] = summed / float(count)
+        elif prev_global_params is not None and key in prev_global_params:
+            aggregated[key] = prev_global_params[key]
+
+    TRAFFIC_STATS["FedHeLLo"]["transmit_MB"] += round_transmit_bytes / MB
+    logging.info(
+        "[FedHeLLo][epoch %d] round_transmit_MB=%.3f trained_layers=%d/%d",
+        epoch,
+        round_transmit_bytes / MB,
+        len(layer_counts),
+        total_layers,
+    )
+    return aggregated
 
 def truncate(selected_clients_set, output_dir, local_dataset_len_dict, epoch, handle_alpha = False):
 

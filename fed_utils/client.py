@@ -15,7 +15,8 @@ import numpy as np
 
 class GeneralClient:
     def __init__(self, client_id, model, tokenizer, prompter, data_path, output_dir, cutoff_len=512, train_on_inputs=True,
-                 cache_dir=None, hetero_lora=False, optim='adamw_torch', dataloader_num_workers=4):
+                 cache_dir=None, hetero_lora=False, optim='adamw_torch', dataloader_num_workers=4,
+                 active_lora_layers=None):
         self.client_id = client_id
         self.model = model
         self.tokenizer = tokenizer
@@ -34,6 +35,7 @@ class GeneralClient:
         self.optim = optim
         self.dataloader_num_workers = dataloader_num_workers
         self.pin_memory = torch.cuda.is_available()
+        self.active_lora_layers = None if active_lora_layers is None else set(active_lora_layers)
 
     def generate_and_tokenize_prompt(self, data_point):
         full_prompt = self.prompter.generate_prompt(
@@ -143,9 +145,16 @@ class GeneralClient:
             dataloader_pin_memory=use_cuda,
         )
 
+        active_set = self.active_lora_layers
         for name, p in self.model.named_parameters():
             if 'lora_' not in name:
                 p.requires_grad = False
+            else:
+                if active_set is None:
+                    p.requires_grad = True
+                else:
+                    base_key = '.'.join(name.split('.')[:-3]) + '.lora'
+                    p.requires_grad = base_key in active_set
         lora_params = [p for n, p in self.model.named_parameters() if ('lora_' in n and p.requires_grad)]
         if len(lora_params) == 0:
             raise ValueError("No LoRA parameters found to optimize. Ensure adapters are added via get_peft_model.")

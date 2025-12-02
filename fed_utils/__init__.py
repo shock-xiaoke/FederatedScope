@@ -16,7 +16,7 @@ def seed_torch(seed, deterministic=False):
     torch.backends.cuda.matmul.allow_tf32 = not deterministic
     torch.backends.cudnn.allow_tf32 = not deterministic
 
-from .model_aggregation import FedAvg, FlexLoRA, truncate, FedHera
+from .model_aggregation import FedAvg, FlexLoRA, truncate, FedHera, FedHeLLo
 from .client_participation_scheduling import client_selection
 from .client import GeneralClient
 from .adaptive_peft import (seed_torch, tokenize, load_weight_local, distribute_weight_fast, modify_adapter,
