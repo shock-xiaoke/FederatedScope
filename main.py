@@ -239,7 +239,7 @@ def read_options():
                         help='local_micro_batch_size')
     parser.add_argument('--dataloader_num_workers', default=4, type=int,
                         help='Number of worker processes for data loading')
-    parser.add_argument('--local_num_epochs', default=1, type=int,
+    parser.add_argument('--local_num_epochs', default=5, type=int,
                         help='local epochs for local client training')
     parser.add_argument('--local_learning_rate', default=1e-6, type=float,
                         help='local training rate for local client training')
