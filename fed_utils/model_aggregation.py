@@ -98,82 +98,79 @@ def FedAvg(selected_clients_set, output_dir, local_dataset_len_dict, epoch, clie
 def FedHeLLo(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
              active_layers_map=None, prev_global_params=None, layer_specs=None):
     """
-    Layer-wise aggregation for Fed-HeLLo that averages only over clients
-    that trained each LoRA layer.
+    Fed-HeLLo 聚合（最小侵入版）：
+    - client 侧已经通过 active_lora_layers 冻结了未分配的 LoRA 层，只保存训练过的 LoRA 参数。
+    - 这里对所有上传的 LoRA 参数做“按样本数加权的 FedAvg”。
+    - 某个参数 key 只在存在该 key 的客户端上做加权平均（其它客户端不参与该 key 的聚合）。
     """
-    del local_dataset_len_dict  # unused but kept for API symmetry
-    layer_counts = {}
-    accum = {}
+    import os
+    from torch.nn.functional import normalize
+
+    # 本函数不再使用 active_layers_map / layer_specs，保留参数仅为兼容现有调用接口
+    del active_layers_map
+    total_layers = len(layer_specs or {})
+
+    # 按本地样本数计算 client 级权重
+    lens = [local_dataset_len_dict[client_id] for client_id in selected_clients_set]
+    weights_array = normalize(
+        torch.tensor(lens, dtype=torch.float32),
+        p=1, dim=0
+    )
+
+    accum = {}         # key -> 加权和
+    weight_sums = {}   # key -> 对应该 key 的权重之和（仅来自有该 key 的客户端）
     round_transmit_bytes = 0.0
     MB = 1024.0 * 1024.0
-    total_layers = len(layer_specs or {})
-    
-    # 新增：用于在 Round 0 捕获完整的参数列表
-    initial_global_state = None
 
     with torch.no_grad():
-        for client_id in selected_clients_set:
+        for idx, client_id in enumerate(selected_clients_set):
             single_output_dir = os.path.join(
-                output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin"
+                output_dir,
+                str(client_id),
+                f"local_output_epoch_{epoch}",
+                "pytorch_model.bin",
             )
             if not os.path.exists(single_output_dir):
                 continue
-            state = torch.load(single_output_dir, map_location="cpu")
-            
-            # --- 修复开始：捕获第一个 Client 的完整状态作为兜底 ---
-            if initial_global_state is None and prev_global_params is None:
-                # 仅在 prev_global_params 为空（Round 0）时需要
-                initial_global_state = {k: v.clone() for k, v in state.items()}
-            # --- 修复结束 ---
 
-            active_layers = set(active_layers_map.get(client_id, [])) if active_layers_map else None
-            updated_layers = set()
+            state = torch.load(single_output_dir, map_location="cpu")
+            w = float(weights_array[idx])
+
             for key, tensor in state.items():
-                # 注意：这里假设 key 的格式是 ...module.lora_A.local.weight
-                # 建议增加容错，但在当前 main.py 设置下是可行的
-                base_key = '.'.join(key.split('.')[:-3]) + '.lora'
-                
-                if active_layers is not None and base_key not in active_layers:
-                    continue
-                updated_layers.add(base_key)
                 if key not in accum:
                     accum[key] = torch.zeros_like(tensor)
-                accum[key] += tensor
+                    weight_sums[key] = 0.0
+                accum[key] += tensor * w
+                weight_sums[key] += w
+
                 round_transmit_bytes += float(tensor.numel() * tensor.element_size())
-            
-            for base_key in updated_layers:
-                layer_counts[base_key] = layer_counts.get(base_key, 0) + 1
+
             del state
             torch.cuda.empty_cache()
 
+    # 先把上一轮的全局参数拷贝过来（主要是为了保留未出现 key 的旧值）
     aggregated = {}
-    
-    # 优先使用上一轮的全局参数
     if prev_global_params is not None:
         aggregated.update({
             k: v.clone() if isinstance(v, torch.Tensor) else v
             for k, v in prev_global_params.items()
         })
-    # --- 修复开始：如果是 Round 0，使用捕获的初始状态 ---
-    elif initial_global_state is not None:
-        aggregated.update(initial_global_state)
-    # --- 修复结束 ---
 
+    # 对每个出现过的 key，根据该 key 的权重和做加权平均
     for key, summed in accum.items():
-        base_key = '.'.join(key.split('.')[:-3]) + '.lora'
-        count = layer_counts.get(base_key, 0)
-        
-        # 只有当至少有一个 Client 训练了该层时，才用平均值覆盖
-        if count > 0:
-            aggregated[key] = summed / float(count)
-        # 否则保留 aggregated 中的旧值（prev_global_params 或 initial_global_state）
+        wsum = weight_sums.get(key, 0.0)
+        if wsum > 0.0:
+            aggregated[key] = summed / wsum
+        else:
+            # 理论上不会出现 wsum=0，如果出现就直接当作简单相加结果
+            aggregated[key] = summed
 
     TRAFFIC_STATS["FedHeLLo"]["transmit_MB"] += round_transmit_bytes / MB
     logging.info(
-        "[FedHeLLo][epoch %d] round_transmit_MB=%.3f trained_layers=%d/%d",
+        "[FedHeLLo][epoch %d] round_transmit_MB=%.3f trained_params=%d total_layers=%d",
         epoch,
         round_transmit_bytes / MB,
-        len(layer_counts),
+        len(accum),
         total_layers,
     )
     return aggregated
