@@ -223,37 +223,70 @@ class GeneralClient:
             dataloader_pin_memory=use_cuda,
         )
         def compute_metrics(pred):
-            # 获取 Logits 和 Labels
+            # ---------------------------------------------------------------------
+            # 1. 预处理：获取 Logits 和 Labels
+            # ---------------------------------------------------------------------
             logits = pred.predictions
             # 如果 logits 是 tuple (比如包含 past_key_values)，取第一个元素
             if isinstance(logits, tuple):
                 logits = logits[0]
             
-            labels_ids = pred.label_ids
+            # 获取原始的 ID
             pred_ids = np.argmax(logits, axis=-1)
+            labels_ids = pred.label_ids # 这里的 labels 包含 -100
 
-            # --- 关键修复：Shift 操作 (对齐预测和标签) ---
-            # Causal LM 中，第 i 个 logit 预测第 i+1 个 token
+            # ---------------------------------------------------------------------
+            # 2. 关键修复：Shift 操作 (对齐预测和标签)
+            # ---------------------------------------------------------------------
+            # Causal LM 中，位置 t 的 Logit 预测的是 t+1 的 Label
+            # 所以我们需要把 预测值左移 (去掉最后一位) 和 标签值右移 (去掉第一位) 来对齐
             shift_preds = pred_ids[:, :-1]
             shift_labels = labels_ids[:, 1:]
 
-            # 创建掩码：忽略 padding (-100)
+            # ---------------------------------------------------------------------
+            # 3. 计算 Token-level Accuracy (替换了原先严苛的 String Accuracy)
+            # ---------------------------------------------------------------------
+            # 创建掩码：忽略 padding 和 label 为 -100 的部分
             mask = (shift_labels != -100)
 
-            # 计算 Token-level Accuracy
+            # 只有在 mask 为 True 的位置才计算是否相等
             matches = (shift_preds == shift_labels) & mask
             correct = matches.sum()
-            total_valid_tokens = mask.sum()
+            total_valid_tokens = max(1, mask.sum())
 
-            token_accuracy = correct / max(1, total_valid_tokens)
+            token_accuracy = correct / total_valid_tokens
 
-            # 保留原有的 ROUGE 计算 (如果需要)
-            # 注意：ROUGE 计算需要 decode，且最好也处理一下 shift
-            # 这里为了性能和避免混淆，建议先只看 token_accuracy
+            # ---------------------------------------------------------------------
+            # 4. 保留 ROUGE 计算 (优化：使用移位后的数据解码，确保文本对齐)
+            # ---------------------------------------------------------------------
+            # 准备解码用的 Pad ID
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
             
+            # 处理标签中的 -100，将其替换为 pad_id 以便 tokenizer 解码
+            # 注意：这里我们使用 shift_labels，这样解码出来的文本和预测文本在语义上是对齐的
+            clean_labels = np.where(shift_labels == -100, pad_id, shift_labels)
+
+            # 解码为字符串
+            pred_str = self.tokenizer.batch_decode(shift_preds, skip_special_tokens=True)
+            label_str = self.tokenizer.batch_decode(clean_labels, skip_special_tokens=True)
+
+            # 计算 ROUGE (加载本地或者在线 metrics)
+            # 确保你的路径 './evaluate/metrics/rouge/rouge.py' 是正确的
+            rouge = evaluate.load('./evaluate/metrics/rouge/rouge.py')
+            rouge_output = rouge.compute(predictions=pred_str, references=label_str, use_aggregator=True)
+
+            # ---------------------------------------------------------------------
+            # 5. 返回合并后的指标
+            # ---------------------------------------------------------------------
             return {
-                'eval_accuracy': round(float(token_accuracy), 4),
-                # 'eval_loss': ... (Trainer 会自动计算 loss，这里不用返回)
+                # 新的 Token 级准确率 (修正后应该不再是 0.0)
+                'accuracy': round(float(token_accuracy), 4),
+                
+                # 原有的 ROUGE 指标
+                'rouge1': round(rouge_output["rouge1"], 4),
+                'rouge2': round(rouge_output["rouge2"], 4),
+                'rougeL': round(rouge_output["rougeL"], 4),
+                'rougeLsum': round(rouge_output["rougeLsum"], 4),
             }
 
         tester = transformers.Trainer(
