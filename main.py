@@ -82,7 +82,7 @@ def calculate_dynamic_budgets(layer_specs, num_clients, hetero_mode, seed=42):
             step_ms *= safety
         tier_bases[tier] = {
             "B_down_MB": float(b_down_mb),
-            "VRAM_MB": 0.0,
+            "VRAM_MB": 64000.0, 
             "step_ms": float(step_ms),
         }
 
