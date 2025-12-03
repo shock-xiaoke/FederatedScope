@@ -40,66 +40,65 @@ import json
 # These are used both for heterogeneous FlexLoRA ranks and, via
 # Fed-Hera, for computing client resource budgets.
 RESOURCE_RANKS = {
-    "poor": 4,
+    "low": 4,
     "medium": 8,
     "high": 16,
 }
 
 
 
-def get_client_budgets(num_clients, hetero_mode, seed=42):
+def calculate_dynamic_budgets(layer_specs, num_clients, hetero_mode, seed=42):
     """
-    Hardcoded per-client resource budgets used for all aggregation methods.
-    setting_A is homogeneous and calibrated so B_down~40MB and step_ms~800
-    yield roughly r_comm~64 and r_comp~16 on Mistral-7B-scale models.
+    Dynamically derive per-client bandwidth/compute budgets that yield
+    fixed target ranks regardless of how many LoRA layers are active.
     """
-    rng = np.random.default_rng(seed)
-    # Setting A (homogeneous) stays as originally calibrated.
-    TIERS_A = {
-        "bandwidth_rich_compute_poor": {"B_down_MB": 96.0, "VRAM_MB": 32000.0, "step_ms": 800.0},
+    layer_specs = layer_specs or {}
+    unit_params = 0
+    for spec in layer_specs.values():
+        d_in = spec.get("d_in")
+        d_out = spec.get("d_out")
+        if d_in is None or d_out is None:
+            continue
+        unit_params += (d_in + d_out)
+
+    unit_comm_cost_bytes = unit_params * 2.0  # BF16/FP16 bytes per param
+    unit_comp_cost_ms = unit_params * 1.7e-04  # matched to model_aggregation.py
+    safety = 1.1
+
+    targets = {
+        "low": {"r_main": 4, "r_tot": 32},
+        "medium": {"r_main": 8, "r_tot": 48},
+        "high": {"r_main": 16, "r_tot": 64},
     }
-    # Setting B (heterogeneous) emphasises decoupled clients:
-    # - weak: low bandwidth + low compute (constrains both methods)
-    # - decoupled: high bandwidth (~r_tot 64+) but low compute (~r_main 8)
-    # - strong: high bandwidth + high compute
-    TIERS_B = {
-        "strong": {
-        "B_down_MB": 96.0,
-        "VRAM_MB":   48000.0,
-        "step_ms":   1600.0,   # 最大时间预算
-        },
-        # decoupled：高带宽 + 低算力
-        "decoupled": {
-            "B_down_MB": 64.0,
-            "VRAM_MB":   32000.0,
-            "step_ms":   800.0,    # 比 strong 小很多
-        },
-        # 弱：低带宽 + 低算力
-        "weak": {
-            "B_down_MB": 32.0,
-            "VRAM_MB":   16000.0,
-            "step_ms":   400.0,    # 最小时间预算
-        },
+
+    tier_bases = {}
+    for tier, tgt in targets.items():
+        b_down_mb = 0.0
+        step_ms = 0.0
+        if unit_params > 0:
+            b_down_mb = (unit_comm_cost_bytes * tgt["r_tot"]) / (1024 * 1024)
+            step_ms = unit_comp_cost_ms * tgt["r_main"]
+            b_down_mb *= safety
+            step_ms *= safety
+        tier_bases[tier] = {
+            "B_down_MB": float(b_down_mb),
+            "VRAM_MB": 0.0,
+            "step_ms": float(step_ms),
+        }
+
+    distributions = {
+        "setting_A": {"probs": [1/3, 1/3, 1/3], "tiers": ["low", "medium", "high"]},
+        "setting_B": {"probs": [0.3, 0.5, 0.2], "tiers": ["low", "medium", "high"]},
     }
 
     client_budgets = {}
-    if hetero_mode == 'setting_A':
-        base = TIERS_A["bandwidth_rich_compute_poor"]
-        for i in range(num_clients):
-            client_budgets[i] = {
-                "tier": "bandwidth_rich_compute_poor",
-                "B_down_MB": float(base["B_down_MB"]),
-                "VRAM_MB": float(base["VRAM_MB"]),
-                "step_ms": float(base["step_ms"]),
-            }
-        return client_budgets
-
-    # setting_B: heavy emphasis on decoupled clients.
-    probs = [0.3, 0.5, 0.2]
-    tier_names = ["weak", "decoupled", "strong"]
+    dist = distributions.get(hetero_mode, distributions["setting_A"])
+    probs = dist["probs"]
+    tier_names = dist["tiers"]
+    rng = np.random.default_rng(seed)
     for i in range(num_clients):
         tier = str(rng.choice(tier_names, p=probs))
-        base = TIERS_B[tier]
+        base = tier_bases[tier]
         client_budgets[i] = {
             "tier": tier,
             "B_down_MB": float(base["B_down_MB"]),
@@ -128,54 +127,28 @@ def extract_lora_layer_specs(model, target_modules):
 
 def calculate_unified_rank_from_budget(client_budgets, layer_specs, max_rank=64):
     """
-    Derive per-client ranks from shared communication/computation budgets.
-    Unit costs are calibrated so that a setting_A client with B_down~40MB and
-    step_ms~800 yields r_comm~64 and r_comp~16 on Mistral-7B-style models.
+    Map resource tiers directly to fixed LoRA ranks (low/medium/high -> 4/8/16).
     """
+    tier_to_rank = {
+        "low": RESOURCE_RANKS["low"],
+        "medium": RESOURCE_RANKS["medium"],
+        "high": RESOURCE_RANKS["high"],
+    }
     rank_map = {}
-
-    total_dim_sum = 0
-    for _, spec in layer_specs.items():
-        d_in = spec.get("d_in")
-        d_out = spec.get("d_out")
-        if d_in is None or d_out is None:
-            continue
-        total_dim_sum += (d_in + d_out)
-
-    if total_dim_sum == 0:
-        return {client_id: 8 for client_id in client_budgets.keys()}
-
-    MB = 1024 * 1024
-    # NF4-ish download with conservative overhead to align setting_A near rank~16.
-    bytes_per_param = 2.0
-    bytes_per_unit_rank = total_dim_sum * bytes_per_param
-
-    # Approximate compute cost calibrated so that setting_A (~1600 ms) yields r_comp ~16.
-    compute_ms_per_param = 1.7e-04
-    time_cost_per_unit_rank = total_dim_sum * compute_ms_per_param
-
-    first_client_debug = True
     for client_id, budget in client_budgets.items():
-        b_down = float(budget.get("B_down_MB", 0.0))
-        step_ms = float(budget.get("step_ms", 0.0))
-
-        r_comm = int((b_down * MB) / bytes_per_unit_rank) if bytes_per_unit_rank > 0 else max_rank
-        r_comp = int(step_ms / time_cost_per_unit_rank) if time_cost_per_unit_rank > 0 else max_rank
-
-        if first_client_debug:
-            print(f"[RankDebug] client {client_id}: r_comm={r_comm} r_comp={r_comp}")
-            first_client_debug = False
-
-        final_r = max(1, min(max_rank, min(r_comm, r_comp)))
+        tier = str(budget.get("tier", "")).lower()
+        r_comm = tier_to_rank.get(tier, RESOURCE_RANKS["medium"])
+        r_comp = r_comm
+        final_r = max(1, min(max_rank, r_comm, r_comp))
         rank_map[client_id] = final_r
-
     return rank_map
+
 
 def calculate_active_layers_from_budget(client_budgets, layer_specs, lora_rank):
     """
     Estimate how many LoRA layers each client can actively train under
     Fed-HeLLo based on bandwidth and step-time budgets.
-    Uses the same per-parameter compute cost as calculate_unified_rank_from_budget.
+    Uses calibrated per-parameter compute/communication costs to gate active layers.
     """
     layer_specs = layer_specs or {}
     total_layers = len(layer_specs)
@@ -300,9 +273,9 @@ def read_options():
     parser.add_argument('--lora_dropout', default=0.05, type=float,
                         help='LoRA dropout')
     parser.add_argument('--lora_target_modules',
-                        default=['q_proj', 'k_proj', 'v_proj'],
+                        default=None,
                         type=parse_lora_target_modules,
-                        help='lora_target_modules (JSON list or comma-separated)',
+                        help='lora_target_modules (JSON list or comma-separated); omit for model-specific defaults',
                         )
 
     args = parser.parse_args()
@@ -384,8 +357,8 @@ def resolve_lora_targets_and_config_types(model, user_target_modules=None):
                 "v_proj",
                 "o_proj",
                 "gate_proj",
-                "down_proj",
                 "up_proj",
+                "down_proj",
             ]
         elif model_type in ["gpt2"]:
             # GPT-2 blocks: attn.c_attn / attn.c_proj / mlp.c_fc / mlp.c_proj
@@ -397,8 +370,8 @@ def resolve_lora_targets_and_config_types(model, user_target_modules=None):
     # Heterogeneous PEFT type presets.
     # Tie the three tiers directly to the canonical
     # resource levels so that FlexLoRA always picks
-    # ranks from {1, 4, 16}.
-    small_r = RESOURCE_RANKS["poor"]
+    # ranks from {4, 8, 16}.
+    small_r = RESOURCE_RANKS["low"]
     medium_r = RESOURCE_RANKS["medium"]
     large_r = RESOURCE_RANKS["high"]
 
@@ -440,7 +413,7 @@ def _resource_probabilities(mode: str):
     Map hetero mode to (low, medium, high) probabilities for FlexLoRA-style rank sampling.
     """
     if mode == 'setting_A':
-        return [1/3, 1/3, 1/3]  # mostly high/medium ranks
+        return [1/3, 1/3, 1/3]  # uniform
     if mode == 'setting_B':
         return [0.3, 0.5, 0.2]  # 30% low, 50% mid, 20% high
     return [1/3, 1/3, 1/3]
@@ -817,7 +790,7 @@ def main():
 
     # Build layer specs and budgets once for all aggregation strategies.
     layer_specs = extract_lora_layer_specs(model, lora_target_modules)
-    client_budgets = get_client_budgets(args.num_clients, args.hetero_mode, seed=args.seed)
+    client_budgets = calculate_dynamic_budgets(layer_specs, args.num_clients, args.hetero_mode, seed=args.seed)
     calculated_ranks = calculate_unified_rank_from_budget(client_budgets, layer_specs)
     FL_training.layer_specs = layer_specs
     FL_training.client_budgets = client_budgets

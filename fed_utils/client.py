@@ -222,33 +222,38 @@ class GeneralClient:
             dataloader_num_workers=self.dataloader_num_workers,
             dataloader_pin_memory=use_cuda,
         )
-
         def compute_metrics(pred):
-            labels_ids = np.array(pred.label_ids)
-            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-            labels_ids = np.where(labels_ids == -100, pad_id, labels_ids)
-            pred_ids = np.argmax(pred.predictions, axis=-1)
-            pred_str = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-            label_str = self.tokenizer.batch_decode(labels_ids, skip_special_tokens=True)
+            # 获取 Logits 和 Labels
+            logits = pred.predictions
+            # 如果 logits 是 tuple (比如包含 past_key_values)，取第一个元素
+            if isinstance(logits, tuple):
+                logits = logits[0]
+            
+            labels_ids = pred.label_ids
+            pred_ids = np.argmax(logits, axis=-1)
 
-            def _norm(x): return x.strip().lower()
+            # --- 关键修复：Shift 操作 (对齐预测和标签) ---
+            # Causal LM 中，第 i 个 logit 预测第 i+1 个 token
+            shift_preds = pred_ids[:, :-1]
+            shift_labels = labels_ids[:, 1:]
 
-            correct = 0
-            for p, l in zip(pred_str, label_str):
-                p_n = _norm(p)
-                l_n = _norm(l)
-                if p_n == l_n or l_n in p_n:
-                    correct += 1
-            accuracy = correct / max(1, len(label_str))
+            # 创建掩码：忽略 padding (-100)
+            mask = (shift_labels != -100)
 
-            rouge = evaluate.load('./evaluate/metrics/rouge/rouge.py')
-            rouge_output = rouge.compute(predictions=pred_str, references=label_str, use_aggregator=True)
+            # 计算 Token-level Accuracy
+            matches = (shift_preds == shift_labels) & mask
+            correct = matches.sum()
+            total_valid_tokens = mask.sum()
+
+            token_accuracy = correct / max(1, total_valid_tokens)
+
+            # 保留原有的 ROUGE 计算 (如果需要)
+            # 注意：ROUGE 计算需要 decode，且最好也处理一下 shift
+            # 这里为了性能和避免混淆，建议先只看 token_accuracy
+            
             return {
-                'rouge1': round(rouge_output["rouge1"], 4),
-                'rouge2': round(rouge_output["rouge2"], 4),
-                'rougeL': round(rouge_output["rougeL"], 4),
-                'rougeLsum': round(rouge_output["rougeLsum"], 4),
-                'accuracy': round(accuracy, 4),
+                'eval_accuracy': round(float(token_accuracy), 4),
+                # 'eval_loss': ... (Trainer 会自动计算 loss，这里不用返回)
             }
 
         tester = transformers.Trainer(
