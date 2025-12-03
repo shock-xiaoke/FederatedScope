@@ -107,6 +107,9 @@ def FedHeLLo(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     round_transmit_bytes = 0.0
     MB = 1024.0 * 1024.0
     total_layers = len(layer_specs or {})
+    
+    # 新增：用于在 Round 0 捕获完整的参数列表
+    initial_global_state = None
 
     with torch.no_grad():
         for client_id in selected_clients_set:
@@ -116,10 +119,20 @@ def FedHeLLo(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             if not os.path.exists(single_output_dir):
                 continue
             state = torch.load(single_output_dir, map_location="cpu")
+            
+            # --- 修复开始：捕获第一个 Client 的完整状态作为兜底 ---
+            if initial_global_state is None and prev_global_params is None:
+                # 仅在 prev_global_params 为空（Round 0）时需要
+                initial_global_state = {k: v.clone() for k, v in state.items()}
+            # --- 修复结束 ---
+
             active_layers = set(active_layers_map.get(client_id, [])) if active_layers_map else None
             updated_layers = set()
             for key, tensor in state.items():
+                # 注意：这里假设 key 的格式是 ...module.lora_A.local.weight
+                # 建议增加容错，但在当前 main.py 设置下是可行的
                 base_key = '.'.join(key.split('.')[:-3]) + '.lora'
+                
                 if active_layers is not None and base_key not in active_layers:
                     continue
                 updated_layers.add(base_key)
@@ -127,25 +140,33 @@ def FedHeLLo(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                     accum[key] = torch.zeros_like(tensor)
                 accum[key] += tensor
                 round_transmit_bytes += float(tensor.numel() * tensor.element_size())
+            
             for base_key in updated_layers:
                 layer_counts[base_key] = layer_counts.get(base_key, 0) + 1
             del state
             torch.cuda.empty_cache()
 
     aggregated = {}
+    
+    # 优先使用上一轮的全局参数
     if prev_global_params is not None:
         aggregated.update({
             k: v.clone() if isinstance(v, torch.Tensor) else v
             for k, v in prev_global_params.items()
         })
+    # --- 修复开始：如果是 Round 0，使用捕获的初始状态 ---
+    elif initial_global_state is not None:
+        aggregated.update(initial_global_state)
+    # --- 修复结束 ---
 
     for key, summed in accum.items():
         base_key = '.'.join(key.split('.')[:-3]) + '.lora'
         count = layer_counts.get(base_key, 0)
+        
+        # 只有当至少有一个 Client 训练了该层时，才用平均值覆盖
         if count > 0:
             aggregated[key] = summed / float(count)
-        elif prev_global_params is not None and key in prev_global_params:
-            aggregated[key] = prev_global_params[key]
+        # 否则保留 aggregated 中的旧值（prev_global_params 或 initial_global_state）
 
     TRAFFIC_STATS["FedHeLLo"]["transmit_MB"] += round_transmit_bytes / MB
     logging.info(
