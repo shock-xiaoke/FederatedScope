@@ -16,7 +16,7 @@ from peft import (
     prepare_model_for_kbit_training,
 )
 from fed_utils import FedAvg, client_selection, seed_torch, GeneralClient, FlexLoRA, \
-    load_weight_local, distribute_weight_fast, modify_adapter, FedHera, FedHeLLo
+    load_weight_local, distribute_weight_fast, modify_adapter, FedHera, FedHeLLo, FLoRA
 from fed_utils.model_aggregation import reset_traffic_stats, get_traffic_stats, TRAFFIC_STATS
 
 import datasets
@@ -219,7 +219,7 @@ def read_options():
     ## FL parameters
     parser.add_argument('--aggregation', default='homo', type=str,
                         help='aggregation method',
-                        choices=['homo', 'flexlora', 'fedhera', 'fedhello'])
+                        choices=['homo', 'flexlora', 'fedhera', 'fedhello', 'flora'])
     parser.add_argument('--hetero_mode', default='setting_B', type=str,
                         choices=['setting_A', 'setting_B'],
                         help='resource heterogeneity preset for Fed-Hera/FlexLoRA')
@@ -503,6 +503,20 @@ def resume(args, data_path, output_dir, config_local):
             layer_specs=FL_training.layer_specs,
         )
         global_params = distribute_weight_fast(global_params, config_local)
+    elif args.aggregation == 'flora':
+            # 1. Aggregate via Stacking (FLoRA specific)
+            global_params = FLoRA(selected_clients_set,
+                                  output_dir,
+                                  local_dataset_len_dict,
+                                  epoch,
+                                  client_budgets=FL_training.client_budgets,
+                                  layer_specs=FL_training.layer_specs)
+            
+            if args.save_model:
+                torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
+                
+            # 2. Distribute via SVD (Reuse FlexLoRA's distribution logic)
+            global_params = distribute_weight_fast(global_params, config_local)
     else:
         global_params = None
     return global_params
@@ -813,6 +827,9 @@ def main():
         fixed_ranks = None
     elif args.aggregation == 'flexlora':
         logging.info("Calculating FlexLoRA ranks based on client budgets...")
+        fixed_ranks = calculated_ranks
+    elif args.aggregation == 'flora':
+        logging.info("Calculating FLoRA ranks based on client budgets (Same as FlexLoRA)...")
         fixed_ranks = calculated_ranks
     elif args.aggregation == 'homo':
         min_rank = min(calculated_ranks.values()) if calculated_ranks else 1

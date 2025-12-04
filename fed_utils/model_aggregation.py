@@ -13,6 +13,7 @@ TRAFFIC_STATS = {
     "FlexLoRA": {"transmit_MB": 0.0, "compute_MB": 0.0},
     "FedHera": {"transmit_MB": 0.0, "compute_MB": 0.0},
     "FedHeLLo": {"transmit_MB": 0.0, "compute_MB": 0.0},
+    "FLoRA": {"transmit_MB": 0.0, "compute_MB": 0.0},
 }
 
 
@@ -29,6 +30,142 @@ def get_traffic_stats():
         for name, stats in TRAFFIC_STATS.items()
     }
 
+def FLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch, client_budgets=None, layer_specs=None):
+    """
+    FLoRA Aggregation: Stack heterogeneous LoRA modules.
+    Ref: FLoRA: Federated Fine-Tuning Large Language Models with Heterogeneous Low-Rank Adaptations
+    
+    Implementation:
+    1. Collect A and B matrices from all clients.
+    2. Apply weighting p_k to Matrix A.
+    3. Stack A (vertically) and B (horizontally).
+    4. Compute B_stack @ A_stack to get the global dense update.
+    5. Return the dense update so 'distribute_weight_fast' can redistribute it via SVD.
+    """
+    # Calculate p_k (weights_array)
+    weights_array = torch.tensor(
+        [local_dataset_len_dict[client_id] for client_id in selected_clients_set], dtype=torch.float32
+    )
+    weights_array = torch.nn.functional.normalize(weights_array, p=1, dim=0)
+    
+    # Storage for stacking
+    # Structure: { 'module_name': { 'A': [list_of_tensors], 'B': [list_of_tensors] } }
+    stacking_buffer = {}
+    
+    round_transmit_bytes = 0.0
+    round_compute_bytes = 0.0
+    compute_ms_per_param = 1.7e-04
+    MB = 1024.0 * 1024.0
+
+    with torch.no_grad():
+        for k, client_id in tqdm(enumerate(selected_clients_set)):
+            single_output_dir = os.path.join(
+                output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin"
+            )
+            single_weights = torch.load(single_output_dir, map_location='cpu')
+            
+            comm_bytes = 0.0
+            comp_time_ms = 0.0
+            
+            for key in list(single_weights.keys()):
+                # Identify valid LoRA A keys
+                if 'local' in key and 'bias' not in key and 'lora_A' in key:
+                    B_key = key.replace('lora_A', 'lora_B')
+                    
+                    # Base module name (e.g., base_model.model.model.layers.0.self_attn.q_proj.lora)
+                    base_key = '.'.join(key.split('.')[:-3]) + '.lora'
+                    
+                    if base_key not in stacking_buffer:
+                        stacking_buffer[base_key] = {'A': [], 'B': []}
+                    
+                    A_w = single_weights[key]
+                    B_w = single_weights[B_key]
+                    rank = A_w.shape[0] # LoRA A is [r, d_in]
+                    
+                    # Apply Scaling Factor p_k to A only (Eq 11 in FLoRA paper)
+                    # Note: We also handle the scaling factor `merge_rate` (alpha/r) here if needed, 
+                    # but typically merge_rate is baked into forward. 
+                    # For consistency with FlexLoRA code in this repo, we apply merge_rate sqrt adjustment or standard logic.
+                    # FlexLoRA code does: (B @ A) * merge_rate * weight.
+                    # To achieve equivalence via stacking: A_new = A * weight * merge_rate, B_new = B.
+                    # Or split merge_rate between them. Let's follow the standard:
+                    merge_rate = 16 / max(rank, 1)
+                    
+                    # We apply the full scalar weight to A for simplicity of stacking
+                    A_weighted = A_w * weights_array[k] * merge_rate
+                    
+                    stacking_buffer[base_key]['A'].append(A_weighted)
+                    stacking_buffer[base_key]['B'].append(B_w)
+
+                    # --- Traffic Stats Tracking ---
+                    d_in = A_w.shape[1]
+                    d_out = B_w.shape[0]
+                    elem_bytes = A_w.element_size()
+                    bytes_this = (d_in + d_out) * rank * elem_bytes
+                    round_transmit_bytes += bytes_this
+                    round_compute_bytes += bytes_this
+                    
+                    if client_budgets is not None:
+                        # Client-side utility tracking
+                        if layer_specs is not None and base_key in layer_specs:
+                            spec = layer_specs[base_key]
+                            d_out_spec = int(spec.get("d_out", d_out))
+                            d_in_spec = int(spec.get("d_in", d_in))
+                        else:
+                            d_out_spec, d_in_spec = d_out, d_in
+                        
+                        comm_bytes += float(rank * (d_in_spec + d_out_spec) * 2.0)
+                        comp_time_ms += float(rank * (d_in_spec + d_out_spec) * compute_ms_per_param)
+
+            if client_budgets is not None:
+                budget = client_budgets.get(int(client_id)) if isinstance(client_budgets, dict) else None
+                if budget is not None:
+                    B_down_bytes = float(budget.get("B_down_MB", 0.0)) * MB
+                    T_ms = float(budget.get("step_ms", 0.0))
+                    comm_util = (comm_bytes / B_down_bytes) if B_down_bytes > 0 else 0.0
+                    comp_util = (comp_time_ms / T_ms) if T_ms > 0 else 0.0
+                    logging.info(
+                        "[FLoRA][epoch %d][client %s] Comm Util: %.1f%%, Comp Util: %.1f%%",
+                        epoch,
+                        str(client_id),
+                        comm_util * 100.0,
+                        comp_util * 100.0,
+                    )
+
+            del single_weights
+            torch.cuda.empty_cache()
+
+    # Perform Stacking and Multiplication
+    weighted_single_weights = {}
+    for base_key, matrices in stacking_buffer.items():
+        if not matrices['A']: 
+            continue
+            
+        # Stack A vertically (dim 0 for [r, d_in]) -> Result [Total_R, d_in]
+        A_stack = torch.cat(matrices['A'], dim=0)
+        
+        # Stack B horizontally (dim 1 for [d_out, r]) -> Result [d_out, Total_R]
+        B_stack = torch.cat(matrices['B'], dim=1)
+        
+        # Compute global dense weight W = B_stack @ A_stack
+        # This effectively sums B_k @ (A_k * p_k)
+        merged_weight = B_stack @ A_stack
+        
+        weighted_single_weights[base_key] = merged_weight
+        
+        del A_stack, B_stack, merged_weight
+        torch.cuda.empty_cache()
+
+    TRAFFIC_STATS["FLoRA"]["transmit_MB"] += round_transmit_bytes / MB
+    TRAFFIC_STATS["FLoRA"]["compute_MB"] += round_compute_bytes / MB
+    logging.info(
+        "[FLoRA][epoch %d] transmit_MB=%.3f compute_MB=%.3f",
+        epoch,
+        round_transmit_bytes / MB,
+        round_compute_bytes / MB,
+    )
+    
+    return weighted_single_weights
 
 def FedAvg(selected_clients_set, output_dir, local_dataset_len_dict, epoch, client_budgets=None, layer_specs=None):
     weights_array = normalize(
