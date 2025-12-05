@@ -730,6 +730,18 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             if args.save_model:
                 torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
             global_params = distribute_weight_fast(global_params, config_local)
+        elif args.aggregation == 'flora':
+            global_params = FLoRA(selected_clients_set,
+                                  output_dir,
+                                  local_dataset_len_dict,
+                                  epoch,
+                                  client_budgets=FL_training.client_budgets,
+                                  layer_specs=FL_training.layer_specs,
+                                  )
+            if args.save_model:
+                torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
+            # FLoRA in this codebase aggregates to dense weights, so we must redistribute via SVD
+            global_params = distribute_weight_fast(global_params, config_local)
         else:
             raise ValueError(f"Unsupported aggregation mode: {args.aggregation}")
 
