@@ -523,67 +523,71 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
 
     # 2. [ATW Logic] Compute s_i and update cache
     if use_atw:
-        logging.info("[FedHera] Computing ATW alignment scores...")
-        
-        # Pre-compute Global Norm for efficiency
-        global_sq_norm = 0.0
-        for g_tensor in aggregated.values():
-            global_sq_norm += torch.sum(g_tensor.float() ** 2).item()
-        global_norm = math.sqrt(global_sq_norm)
+    logging.info("[FedHera] Computing ATW alignment scores with Trace Optimization...")
 
-        for client_id in selected_clients_set:
-            single_output = os.path.join(output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin")
-            if not os.path.exists(single_output):
-                continue
-                
-            state = torch.load(single_output, map_location="cpu")
-            dot_product = 0.0
-            client_sq_norm = 0.0
+    # 1. 计算全局 Global Norm
+    global_sq_norm = 0.0
+    for g_tensor in aggregated.values():
+        global_sq_norm += torch.linalg.norm(g_tensor.float()) ** 2
+    global_norm = math.sqrt(global_sq_norm)
+
+    for client_id in selected_clients_set:
+        single_output = os.path.join(output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin")
+        if not os.path.exists(single_output):
+            continue
             
-            # Iterate over aggregated keys to ensure alignment of layers
-            for base_key, g_tensor in aggregated.items():
-                # Reconstruct keys from base_key
-                # base_key is like "base_model...q_proj.lora"
-                # client keys are like "base_model...q_proj.lora_A.weight" or "...lora_A.local.weight"
-                
-                # Heuristic to find A and B in client state
-                prefix = base_key.rsplit('.lora', 1)[0]
-                
-                key_A = None
-                key_B = None
-                
-                # Scan state keys for match
-                for k in state.keys():
-                    if prefix in k and 'lora_A' in k:
-                        key_A = k
-                        key_B = k.replace('lora_A', 'lora_B')
-                        break
-                
-                if key_A and key_B:
-                    A_mat = state[key_A].float()
-                    B_mat = state[key_B].float()
-                    rank = B_mat.shape[1]
-                    merge_rate = 16 / max(rank, 1)
-                    
-                    # Reconstruct Delta W_i
-                    local_delta = (B_mat @ A_mat) * merge_rate
-                    
-                    # Accumulate dot product and norm
-                    # Flatten is implicit in sum(element-wise * element-wise)
-                    dot_product += torch.sum(local_delta * g_tensor.float()).item()
-                    client_sq_norm += torch.sum(local_delta ** 2).item()
+        state = torch.load(single_output, map_location="cpu")
+        dot_product = 0.0
+        client_sq_norm = 0.0
+        
+        for base_key, g_tensor in aggregated.items():
+            prefix = base_key.rsplit('.lora', 1)[0]
+            key_A = None
+            key_B = None
             
-            client_norm = math.sqrt(client_sq_norm)
+            # 寻找对应的 A 和 B
+            for k in state.keys():
+                if prefix in k and 'lora_A' in k:
+                    key_A = k
+                    key_B = k.replace('lora_A', 'lora_B')
+                    break
             
-            # Cosine Sim
-            if global_norm > 1e-6 and client_norm > 1e-6:
-                s_i = dot_product / (global_norm * client_norm)
-            else:
-                s_i = 0.0
-            
-            # Update Cache
-            FEDHERA_CLIENT_STATS[int(client_id)] = {"s": s_i, "t": epoch}
-            del state
+            if key_A and key_B:
+                A_mat = state[key_A].float() # (r, k)
+                B_mat = state[key_B].float() # (d, r)
+                G_mat = g_tensor.float()     # (d, k)
+                
+                rank = B_mat.shape[1]
+                merge_rate = 16 / max(rank, 1)
+                
+                # --- 优化1: Dot Product ---
+                # 计算 <BA, G> = Tr(A^T B^T G)
+                # 先算 (B^T G) -> (r, k)
+                temp_res = B_mat.T @ G_mat 
+                # 再算 sum(A * temp_res)
+                contribution = torch.sum(A_mat * temp_res).item()
+                dot_product += contribution * merge_rate
+                
+                # --- 优化2: Client Norm ---
+                # 计算 ||BA||^2 = Tr((B^T B)(A A^T))
+                # 这一步避免了生成 (d, k) 的大矩阵，全程只处理 (r, r) 的小矩阵
+                BT_B = B_mat.T @ B_mat   # (r, r)
+                A_AT = A_mat @ A_mat.T   # (r, r)
+                trace_norm = torch.sum(BT_B * A_AT).item()
+                
+                client_sq_norm += trace_norm * (merge_rate ** 2)
+
+        client_norm = math.sqrt(client_sq_norm)
+        
+        # Cosine Sim
+        if global_norm > 1e-6 and client_norm > 1e-6:
+            s_i = dot_product / (global_norm * client_norm)
+        else:
+            s_i = 0.0
+        
+        # Update Cache
+        FEDHERA_CLIENT_STATS[int(client_id)] = {"s": s_i, "t": epoch}
+        del state
 
     # 3. SVD Phase
     basis_version = epoch // max(basis_update_every, 1)
