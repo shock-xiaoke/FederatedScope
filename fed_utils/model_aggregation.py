@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import math
 import os
 from torch.nn.functional import normalize
 import gc
@@ -15,6 +16,8 @@ TRAFFIC_STATS = {
     "FedHeLLo": {"transmit_MB": 0.0, "compute_MB": 0.0},
     "FLoRA": {"transmit_MB": 0.0, "compute_MB": 0.0},
 }
+# [NEW] Global cache for ATW stats: {client_id: {"s": float, "t": int}}
+FEDHERA_CLIENT_STATS = {}
 
 
 def reset_traffic_stats():
@@ -447,15 +450,18 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             basis_update_every=5,
             fixed_client_ranks=None,
             ablation=None,
-            lora_alpha=16):
+            lora_alpha=16,
+            use_atw=False):
     """
     Fed-Hera aggregation:
     1) Merge client adapters into W_global.
-    2) Run SVD to refresh basis.
-    3) Allocate r_tot/r_main per client (water-filling or ablation).
-    4) Push truncated A/B plus meta (r_main) back to clients.
+    2) [ATW] Compute alignment scores s_i and update cache.
+    3) Run SVD to refresh basis.
+    4) Allocate r_tot/r_main per client.
+    5) [ATW] Calculate lambda and Push truncated A/B plus meta back to clients.
     """
     compute_ms_per_param = 1.7e-04
+    
     def _uniform_allocation(layers, bytes_per_col, c_mem_per_col, c_time_per_col,
                             B_down_bytes, M_bytes, T_ms, target_rank=None):
         total_bytes = max(sum(bytes_per_col.values()), 1)
@@ -495,9 +501,10 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     weights_array = torch.tensor([local_dataset_len_dict[c] for c in selected_clients_set], dtype=torch.float32)
     weights_array = torch.nn.functional.normalize(weights_array, p=1, dim=0)
 
+    # 1. Aggregation Phase
     with torch.no_grad():
         aggregated = {}
-        for k, client_id in tqdm(enumerate(selected_clients_set)):
+        for k, client_id in tqdm(enumerate(selected_clients_set), desc="FedHera Aggregation"):
             single_output = os.path.join(output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin")
             state = torch.load(single_output, map_location="cpu")
             for key in list(state.keys()):
@@ -514,8 +521,72 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             del state
             torch.cuda.empty_cache()
 
-    basis_version = epoch // max(basis_update_every, 1)
+    # 2. [ATW Logic] Compute s_i and update cache
+    if use_atw:
+        logging.info("[FedHera] Computing ATW alignment scores...")
+        
+        # Pre-compute Global Norm for efficiency
+        global_sq_norm = 0.0
+        for g_tensor in aggregated.values():
+            global_sq_norm += torch.sum(g_tensor.float() ** 2).item()
+        global_norm = math.sqrt(global_sq_norm)
 
+        for client_id in selected_clients_set:
+            single_output = os.path.join(output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin")
+            if not os.path.exists(single_output):
+                continue
+                
+            state = torch.load(single_output, map_location="cpu")
+            dot_product = 0.0
+            client_sq_norm = 0.0
+            
+            # Iterate over aggregated keys to ensure alignment of layers
+            for base_key, g_tensor in aggregated.items():
+                # Reconstruct keys from base_key
+                # base_key is like "base_model...q_proj.lora"
+                # client keys are like "base_model...q_proj.lora_A.weight" or "...lora_A.local.weight"
+                
+                # Heuristic to find A and B in client state
+                prefix = base_key.rsplit('.lora', 1)[0]
+                
+                key_A = None
+                key_B = None
+                
+                # Scan state keys for match
+                for k in state.keys():
+                    if prefix in k and 'lora_A' in k:
+                        key_A = k
+                        key_B = k.replace('lora_A', 'lora_B')
+                        break
+                
+                if key_A and key_B:
+                    A_mat = state[key_A].float()
+                    B_mat = state[key_B].float()
+                    rank = B_mat.shape[1]
+                    merge_rate = 16 / max(rank, 1)
+                    
+                    # Reconstruct Delta W_i
+                    local_delta = (B_mat @ A_mat) * merge_rate
+                    
+                    # Accumulate dot product and norm
+                    # Flatten is implicit in sum(element-wise * element-wise)
+                    dot_product += torch.sum(local_delta * g_tensor.float()).item()
+                    client_sq_norm += torch.sum(local_delta ** 2).item()
+            
+            client_norm = math.sqrt(client_sq_norm)
+            
+            # Cosine Sim
+            if global_norm > 1e-6 and client_norm > 1e-6:
+                s_i = dot_product / (global_norm * client_norm)
+            else:
+                s_i = 0.0
+            
+            # Update Cache
+            FEDHERA_CLIENT_STATS[int(client_id)] = {"s": s_i, "t": epoch}
+            del state
+
+    # 3. SVD Phase
+    basis_version = epoch // max(basis_update_every, 1)
     per_layer_USV = {}
     for layer_key in list(aggregated.keys()):
         Wg = aggregated[layer_key]
@@ -533,6 +604,7 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
 
     gc.collect()
 
+    # 4. Allocation & Push Phase
     quant_main, quant_res = quant_scheme
     BYTE_MAP = {"fp16": 2, "bfloat16": 2, "int8": 1, "nf4": 0.5, "int4": 0.5}
     bytes_down_main = BYTE_MAP.get(quant_main, 2.0)
@@ -567,8 +639,7 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             layers[layer_key] = {"sigma": sigma, "d_out": d_out, "d_in": d_in}
             bytes_per_col[layer_key] = int((d_out + d_in) * bytes_down_main)
             c_mem_per_col[layer_key] = int((d_out + d_in) * 2.0 * 3.5)
-            compute_ms_per_param = 1.7e-04  # 与 main.py 里的数保持同步
-            # 每个 rank 的时间成本 ≈ (d_out + d_in) * compute_ms_per_param
+            compute_ms_per_param = 1.7e-04  
             c_time_per_col[layer_key] = float((d_out + d_in) * compute_ms_per_param)
 
         if ablation == "uniform":
@@ -584,30 +655,61 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                 r_tot, _ = allocate_r_tot_for_client(layers, B_down_bytes, bytes_per_col)
             r_main, _, _ = allocate_r_main_for_client(layers, r_tot, M_bytes, T_ms, c_mem_per_col, c_time_per_col)
 
+        # [ATW Logic] Calculate Lambda for this client
+        lambda_val = 1.0 # Default Static
+        if use_atw:
+            # Retrieve cached stats
+            stat = FEDHERA_CLIENT_STATS.get(int(client_id), {"s": 0.0, "t": -1})
+            s_stored = stat["s"]
+            t_hat = stat["t"]
+            
+            beta = 0.9 # Hardcoded per requirement
+            
+            # Note: For selected clients, t_hat == epoch because we just updated it.
+            # So decay factor beta^(epoch - epoch) == 1. This uses the fresh score.
+            # The formula works for stale clients too if we were to serve them.
+            
+            current_round = epoch + 1
+            decay = beta ** (epoch - t_hat)
+            
+            # Formula: 1 - exp( - (1 + s * beta^(t-that)) * t / 2 )
+            exponent = -1.0 * (1.0 + s_stored * decay) * current_round / 2.0
+            lambda_val = 1.0 - math.exp(exponent)
+            
+            # Clip for safety
+            lambda_val = max(0.0, min(1.0, lambda_val))
+            
+            if client_id == selected_clients_set[0]: # Log once per round
+                logging.info(f"[ATW] Client {client_id}: s={s_stored:.4f}, lambda={lambda_val:.4f}")
+
         push_dir = os.path.join(output_dir, str(client_id), f"server_push_epoch_{epoch}")
         os.makedirs(push_dir, exist_ok=True)
         pkg = {}
         meta = {}
         ablation_mode = ablation if ablation is not None else "water_filling"
+
         for layer_key, usv in per_layer_USV.items():
             rt = int(r_tot.get(layer_key, 0))
             if rt <= 0:
                 meta[layer_key] = {"skip": True, "basis_version": basis_version, "r_tot": 0, "r_main": 0,
                                    "ablation": ablation_mode}
                 continue
+            
             U = usv["U"][:, :rt]
             S = usv["S"][:rt]
             Vh = usv["Vh"][:rt, :]
-            # Pre-scale the singular values so that (B@A)*(alpha/rt) matches W_svd on the client.
+            
             scale_up = float(rt) / float(max(lora_alpha, 1e-12))
             S = S * scale_up
             sroot = torch.sqrt(S)
             B = (U * sroot.unsqueeze(0))
             A = (sroot.unsqueeze(1) * Vh)
+            
             Akey = layer_key + "_A.local.weight"
             Bkey = layer_key + "_B.local.weight"
             pkg[Akey] = A.float().cpu()
             pkg[Bkey] = B.float().cpu()
+            
             meta[layer_key] = {
                 "skip": False,
                 "basis_version": basis_version,
@@ -616,14 +718,16 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                 "quant_main": quant_main,
                 "quant_res": quant_res,
                 "ablation": ablation_mode,
+                "lambda": lambda_val # Write lambda to meta
             }
             del U, S, Vh, B, A
+        
         torch.save(pkg, os.path.join(push_dir, "pytorch_model.bin"))
         with open(os.path.join(push_dir, "meta.json"), "w") as f:
             json.dump(meta, f)
         torch.cuda.empty_cache()
 
-        # Track communication/compute stats for this client based on the written meta.
+        # Track communication/compute stats...
         client_transmit_bytes = 0.0
         client_compute_bytes = 0.0
         comp_time_ms = 0.0
@@ -651,11 +755,7 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             if d_out is None or d_in is None:
                 continue
 
-            Akey = layer_key + "_A.local.weight"
-            Bkey = layer_key + "_B.local.weight"
-            # Use the quantized main precision for accounting to match budgets.
             elem_bytes = bytes_down_main
-
             bytes_per_rank = (d_out + d_in) * elem_bytes
             client_transmit_bytes += bytes_per_rank * rt
             client_compute_bytes += bytes_per_rank * rm

@@ -277,6 +277,9 @@ def read_options():
                         type=parse_lora_target_modules,
                         help='lora_target_modules (JSON list or comma-separated); omit for model-specific defaults',
                         )
+    parser.add_argument('--use_atw', action='store_true', default=False,
+                        help='Enable Adaptive Tail Warm-up (ATW) for FedHera. '
+                             'If False, lambda is fixed to 1.0 (Static Tail).')
 
     args = parser.parse_args()
     if isinstance(args.ablation, str) and args.ablation.lower() == "none":
@@ -704,6 +707,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 basis_update_every=args.basis_update_every,
                 ablation=args.ablation,
                 lora_alpha=args.lora_alpha,
+                use_atw=args.use_atw  # [新增] 传递参数
             )
             # adapter_model.bin 可存聚合Wg，便于可视化/对照
             # torch.save(_, os.path.join(output_dir, "adapter_model.bin"))

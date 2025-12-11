@@ -169,17 +169,66 @@ def apply_lora_prefix_mask(peft_model, per_layer_r_main):
             hooks.append(param.register_hook(_make_hook(mask)))
     return hooks
 
+# [修改] fed_utils/adaptive_peft.py
+
 def load_weight_fedhera_if_exists(output_dir, client_id, epoch):
     """
     若存在 server_push 包，读取并返回 (state_dict, meta)；否则返回 (None, None)
+    新增逻辑：如果 meta 中包含 lambda 且 lambda < 1，则对 Frozen Tail 进行缩放。
     """
     import os, json, torch
     push_dir = os.path.join(output_dir, str(client_id), f"server_push_epoch_{epoch}")
     model_path = os.path.join(push_dir, "pytorch_model.bin")
     meta_path  = os.path.join(push_dir, "meta.json")
+    
     if os.path.exists(model_path) and os.path.exists(meta_path):
         state = torch.load(model_path, map_location="cpu")
         with open(meta_path, "r") as f:
             meta = json.load(f)
+            
+        # [新增] 应用 ATW Lambda Scaling
+        # 我们需要在加载前修改 state 中的权重
+        # 逻辑：对于每一层，获取 r_main 和 lambda。
+        # A: [r_tot, d_in] -> Tail 是 row[r_main:]
+        # B: [d_out, r_tot] -> Tail 是 col[:, r_main:]
+        # 将 Tail 部分乘以 sqrt(lambda) (因为 W = B@A，两边各乘 sqrt(lambda) 等于整体乘 lambda)
+        # 或者只乘一边。为了对称，通常各乘 sqrt(lambda)。
+        
+        # 检查是否所有层的 lambda 都一样（目前的实现是 client 级 lambda）
+        # 直接遍历 meta 即可
+        
+        for layer_key, info in meta.items():
+            if info.get("skip", False):
+                continue
+            
+            lambda_val = info.get("lambda", 1.0)
+            if lambda_val >= 0.999: # 接近 1 则不处理
+                continue
+                
+            r_main = int(info.get("r_main", 0))
+            r_tot = int(info.get("r_tot", 0))
+            
+            if r_main >= r_tot: # 没有 tail
+                continue
+
+            # 找到对应的 tensor key
+            # meta key 是 base key (e.g. ...lora), state key 是 ...lora_A.local.weight
+            key_A = layer_key + "_A.local.weight"
+            key_B = layer_key + "_B.local.weight"
+            
+            if key_A in state and key_B in state:
+                # Scale Factor
+                # h = Wx + s * (Main + lambda * Tail)
+                # Tail_new = Tail_old * lambda
+                # 由于 A 和 B 是分解的，我们将 A_tail 和 B_tail 都乘以 sqrt(lambda)
+                scale = lambda_val ** 0.5
+                
+                # Process A: Shape [r, d_in], Tail is rows [r_main:]
+                state[key_A][r_main:, :] *= scale
+                
+                # Process B: Shape [d_out, r], Tail is cols [:, r_main:]
+                state[key_B][:, r_main:] *= scale
+                
         return state, meta
+        
     return None, None
