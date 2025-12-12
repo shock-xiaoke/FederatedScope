@@ -554,6 +554,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
     best_rouge_L = 0
     patience = args.patience
     current_count = 0
+    dense_global_params = None
     if args.resume_epoch:
         global_params = resume(args, data_path, output_dir, config_local)
         start_epoch = args.resume_epoch
