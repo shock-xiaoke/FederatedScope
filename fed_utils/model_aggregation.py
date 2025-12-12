@@ -683,7 +683,7 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             # Clip for safety
             lambda_val = max(0.0, min(1.0, lambda_val))
             
-            if client_id == selected_clients_set[0]: # Log once per round
+            if client_id == sorted(list(selected_clients_set))[0]: # Log once per round
                 logging.info(f"[ATW] Client {client_id}: s={s_stored:.4f}, lambda={lambda_val:.4f}")
 
         push_dir = os.path.join(output_dir, str(client_id), f"server_push_epoch_{epoch}")
