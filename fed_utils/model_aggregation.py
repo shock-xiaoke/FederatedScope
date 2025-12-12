@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import math
+import copy
 import os
 from torch.nn.functional import normalize
 import gc
@@ -790,3 +791,165 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
 
     return aggregated
 
+
+def FedHL(selected_clients_set, output_dir, local_dataset_len_dict, epoch, prev_global_params, layer_specs=None):
+    """
+    FedHL: Federated Learning for Heterogeneous LoRA via Unbiased Aggregation.
+    Paper: arXiv:2505.18494v1
+
+    Formula: W_{t+1} = W_t + sum( p_i * (W_{client_i} - W_t^{rank_i}) )
+    Where p_i is optimized based on truncation error.
+    """
+    logging.info(f"[FedHL] Starting aggregation for epoch {epoch}")
+    
+    # 1. 预计算全局模型 W_t 的 SVD 信息 (用于计算 truncation error 和 W_t^{r_i})
+    # prev_global_params 是 W_t (Dense weights)
+    # 我们按层缓存 SVD 结果： {layer_key: (U, S, Vh, S_squared_sum)}
+    layer_svd_cache = {}
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # 筛选出需要 LoRA 的层 (即存在于 global_params 中的层)
+    # 注意：prev_global_params 通常是完整的 state_dict 或仅包含 adapter 对应的 dense weight
+    # 这里假设 prev_global_params 是 dense weight 字典
+    
+    # 2. 第一遍循环：收集所有客户端的 Rank 信息，计算 Truncation Error (\hat{r}_i)
+    client_ranks = {}      # client_id -> {layer_key: rank}
+    client_errors = {}     # client_id -> total_truncation_error
+    client_updates_cache = {} # 缓存加载的客户端模型，避免重复 IO
+    
+    epsilon = 1e-6 # 防止除零
+    
+    for client_id in tqdm(selected_clients_set, desc="[FedHL] Computing Errors"):
+        single_output_dir = os.path.join(output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin")
+        if not os.path.exists(single_output_dir):
+            continue
+            
+        single_weights = torch.load(single_output_dir, map_location='cpu')
+        client_updates_cache[client_id] = single_weights
+        
+        current_client_ranks = {}
+        total_error = 0.0
+        
+        for key in single_weights.keys():
+            # 识别 LoRA A 矩阵
+            if 'local' in key and 'lora_A' in key:
+                base_key = '.'.join(key.split('.')[:-3]) + '.lora'
+                B_key = key.replace('lora_A', 'lora_B')
+                
+                # 获取 Client Rank
+                rank = single_weights[key].shape[0] # A is [r, d_in]
+                current_client_ranks[base_key] = rank
+                
+                # 确保全局模型中有该层，并计算 SVD
+                if base_key not in prev_global_params:
+                    # 可能是新层或者命名不匹配，暂时跳过
+                    continue
+                
+                if base_key not in layer_svd_cache:
+                    # 计算 SVD 并缓存
+                    W_t_layer = prev_global_params[base_key].to(device).float()
+                    # 使用 full_matrices=False 以节省显存
+                    U, S, Vh = torch.linalg.svd(W_t_layer, full_matrices=False)
+                    layer_svd_cache[base_key] = (U.cpu(), S.cpu(), Vh.cpu())
+                    del W_t_layer
+                    torch.cuda.empty_cache()
+                
+                # 计算 Truncation Error: || W_t - W_t^r ||^2
+                # 等价于 sum(sigma_{r+1}^2 ... sigma_{end}^2)
+                _, S, _ = layer_svd_cache[base_key]
+                # S 是奇异值向量，从大到小排列
+                truncated_singular_values = S[rank:]
+                layer_error = torch.sum(truncated_singular_values ** 2).item()
+                total_error += layer_error
+                
+        client_ranks[client_id] = current_client_ranks
+        client_errors[client_id] = total_error
+
+    # 3. 计算最优聚合权重 p_i (Theorem 3)
+    # p_i* = (1 / (error_i^2 + eps)) / sum(...)
+    # 注意：论文中 error 定义为 \hat{r}_i = ||...||^2，所以这里直接用 total_error
+    
+    p_numerators = {}
+    p_denom_sum = 0.0
+    
+    for cid in selected_clients_set:
+        err = client_errors.get(cid, 0.0)
+        # 论文公式 (15): p_i = (1 / (r_i^2 + epsilon)) ... 这里的 r_i 指的是 truncation error \hat{r}_i
+        # 因为我们上面算的 total_error 已经是 ||...||^2 了，所以这里直接用 total_error
+        # 但论文写的是 \hat{r}_i^2，我们需要确认 \hat{r}_i 是定义为范数还是范数平方。
+        # 论文 Eq(8): \hat{r}_i(t) = || W - W^r ||^2. 
+        # Theorem 3 Eq(15) 分母是 \hat{r}_i^2 + epsilon. 这里的 \hat{r}_i 指代上面的定义。
+        # 所以是 (Error)^2.
+        
+        val = 1.0 / ( (err ** 2) + epsilon )
+        p_numerators[cid] = val
+        p_denom_sum += val
+        
+    optimal_weights = {cid: val / p_denom_sum for cid, val in p_numerators.items()}
+    
+    # 记录权重信息
+    log_weights = {cid: f"{w:.4f}" for cid, w in optimal_weights.items()}
+    logging.info(f"[FedHL] Aggregation Weights: {str(log_weights)}")
+
+    # 4. 执行聚合: W_{t+1} = W_t + sum( p_i * (W_{t+1}^i - W_t^{r_i}) )
+    # 初始化 Delta accumulator
+    global_delta = {k: torch.zeros_like(v, device='cpu') for k, v in prev_global_params.items()}
+    
+    for client_id in tqdm(selected_clients_set, desc="[FedHL] Aggregating"):
+        weight = optimal_weights[client_id]
+        single_weights = client_updates_cache[client_id]
+        ranks = client_ranks.get(client_id, {})
+        
+        for key in single_weights.keys():
+            if 'local' in key and 'lora_A' in key:
+                base_key = '.'.join(key.split('.')[:-3]) + '.lora'
+                B_key = key.replace('lora_A', 'lora_B')
+                
+                if base_key not in layer_svd_cache:
+                    continue
+                    
+                # 1. 重构客户端模型 W_{t+1}^i = B @ A
+                B_mat = single_weights[B_key].float()
+                A_mat = single_weights[key].float()
+                
+                rank = ranks[base_key]
+                # 注意：Adaptive PEFT 代码中，forward 包含 scaling (alpha/r)。
+                # 但 distribute_weight_fast 通常把 scaling 并在 B 或 A 里。
+                # 检查 FlexLoRA/FLoRA 实现，通常需要在聚合时乘 merge_rate。
+                # 在本代码库的 FL_training 中，distribute_weight_fast 使用 weight_dict[..._B...] = lora_B / merge_rate
+                # 意味着存储的权重被除过了，forward 时乘回来。
+                # 这里我们需要恢复其数学上的值用于加减。
+                merge_rate = 16.0 / max(rank, 1) # assuming alpha=16
+                
+                # W_client = (B @ A) * scale
+                W_client = (B_mat @ A_mat) * merge_rate
+                
+                # 2. 重构初始截断模型 W_t^{r_i} = U_r S_r V_r^T
+                U, S, Vh = layer_svd_cache[base_key]
+                U_r = U[:, :rank]
+                S_r = S[:rank]
+                Vh_r = Vh[:rank, :]
+                
+                W_truncated = (U_r @ torch.diag(S_r) @ Vh_r)
+                
+                # 3. 计算差异 Delta = p_i * (W_client - W_truncated)
+                diff = (W_client - W_truncated) * weight
+                
+                # 累加到 Global Delta
+                if base_key in global_delta:
+                    global_delta[base_key] += diff
+                
+    # 5. 更新全局模型: W_{t+1} = W_t + Delta
+    new_global_params = copy.deepcopy(prev_global_params)
+    for k, v in new_global_params.items():
+        if k in global_delta:
+            new_global_params[k] = v + global_delta[k]
+            
+    # 清理缓存
+    del layer_svd_cache
+    del client_updates_cache
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    return new_global_params

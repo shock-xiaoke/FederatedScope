@@ -16,7 +16,7 @@ from peft import (
     prepare_model_for_kbit_training,
 )
 from fed_utils import FedAvg, client_selection, seed_torch, GeneralClient, FlexLoRA, \
-    load_weight_local, distribute_weight_fast, modify_adapter, FedHera, FedHeLLo, FLoRA
+    load_weight_local, distribute_weight_fast, modify_adapter, FedHera, FedHeLLo, FLoRA, FedHL
 from fed_utils.model_aggregation import reset_traffic_stats, get_traffic_stats, TRAFFIC_STATS
 
 import datasets
@@ -219,7 +219,7 @@ def read_options():
     ## FL parameters
     parser.add_argument('--aggregation', default='homo', type=str,
                         help='aggregation method',
-                        choices=['homo', 'flexlora', 'fedhera', 'fedhello', 'flora'])
+                        choices=['homo', 'flexlora', 'fedhera', 'fedhello', 'flora', 'fedhl'])
     parser.add_argument('--hetero_mode', default='setting_B', type=str,
                         choices=['setting_A', 'setting_B'],
                         help='resource heterogeneity preset for Fed-Hera/FlexLoRA')
@@ -560,6 +560,21 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
     else:
         start_epoch = 0
         global_params = None
+    
+    if args.aggregation == 'fedhl' and dense_global_params is None:
+        logging.info("[FedHL] Initializing global parameters from pre-trained model...")
+        dense_global_params = {} # 初始化 Dense 字典
+        
+        for key in FL_training.layer_specs.keys():
+            # key example: base_model.model.model.layers.0.self_attn.q_proj.lora
+            module_name = key.replace("base_model.model.", "").replace(".lora", "")
+            try:
+                sub_module = model.get_submodule(module_name)
+                if hasattr(sub_module, "weight"):
+                    # 必须 clone 到 CPU
+                    dense_global_params[key] = sub_module.weight.detach().cpu().clone()
+            except Exception as e:
+                logging.warning(f"Could not load init weight for {key}: {e}")
 
     optim = 'sgd' if args.baseline == 'fedavg' else 'adamw_torch'
     fedhello_layer_keys = sorted(FL_training.layer_specs.keys()) if args.aggregation == 'fedhello' else []
@@ -746,6 +761,23 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
             # FLoRA in this codebase aggregates to dense weights, so we must redistribute via SVD
             global_params = distribute_weight_fast(global_params, config_local)
+        elif args.aggregation == 'fedhl':
+            
+            new_dense_params = FedHL(
+                selected_clients_set,
+                output_dir,
+                local_dataset_len_dict,
+                epoch,
+                prev_global_params=dense_global_params, 
+                layer_specs=FL_training.layer_specs
+            )
+            
+            dense_global_params = new_dense_params
+            
+            if args.save_model:
+                torch.save(dense_global_params, os.path.join(output_dir, "dense_model.bin"))
+                
+            global_params = distribute_weight_fast(dense_global_params, config_local)
         else:
             raise ValueError(f"Unsupported aggregation mode: {args.aggregation}")
 
