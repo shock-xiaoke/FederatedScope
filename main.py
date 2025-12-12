@@ -879,6 +879,9 @@ def main():
     elif args.aggregation == 'flora':
         logging.info("Calculating FLoRA ranks based on client budgets (Same as FlexLoRA)...")
         fixed_ranks = calculated_ranks
+    elif args.aggregation == 'fedhl':
+        logging.info("Calculating FedHL ranks based on client budgets...")
+        fixed_ranks = calculated_ranks
     elif args.aggregation == 'homo':
         min_rank = min(calculated_ranks.values()) if calculated_ranks else 1
         logging.info(f"Homo: Bottleneck detected. Setting unified rank to {min_rank} for all clients.")
