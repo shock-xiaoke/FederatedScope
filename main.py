@@ -563,20 +563,16 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
         global_params = None
     
     if args.aggregation == 'fedhl' and dense_global_params is None:
-        logging.info("[FedHL] Initializing global parameters from pre-trained model...")
-        dense_global_params = {} # 初始化 Dense 字典
-        
-        for key in FL_training.layer_specs.keys():
-            # key example: base_model.model.model.layers.0.self_attn.q_proj.lora
-            module_name = key.replace("base_model.model.", "").replace(".lora", "")
-            try:
-                sub_module = model.get_submodule(module_name)
-                if hasattr(sub_module, "weight"):
-                    # 必须 clone 到 CPU
-                    dense_global_params[key] = sub_module.weight.detach().cpu().clone()
-            except Exception as e:
-                logging.warning(f"Could not load init weight for {key}: {e}")
-        logging.info("[FedHL] Performing initial SVD distribution for Round 0...")
+        logging.info("[FedHL] Initializing dense global LoRA-update W0 as ZEROS (delta adapter).")
+        dense_global_params = {}
+
+        for key, spec in FL_training.layer_specs.items():
+            d_out = int(spec.get("d_out", 0))
+            d_in  = int(spec.get("d_in", 0))
+            assert d_out > 0 and d_in > 0, f"Bad layer spec for {key}: {spec}"
+            dense_global_params[key] = torch.zeros((d_out, d_in), dtype=torch.float32)
+
+        logging.info("[FedHL] Performing initial SVD distribution for Round 0.")
         global_params = distribute_weight_fast(dense_global_params, config_local)
 
     optim = 'sgd' if args.baseline == 'fedavg' else 'adamw_torch'
