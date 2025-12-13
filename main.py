@@ -576,6 +576,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                     dense_global_params[key] = sub_module.weight.detach().cpu().clone()
             except Exception as e:
                 logging.warning(f"Could not load init weight for {key}: {e}")
+        logging.info("[FedHL] Performing initial SVD distribution for Round 0...")
+        global_params = distribute_weight_fast(dense_global_params, config_local)
 
     optim = 'sgd' if args.baseline == 'fedavg' else 'adamw_torch'
     fedhello_layer_keys = sorted(FL_training.layer_specs.keys()) if args.aggregation == 'fedhello' else []
@@ -654,7 +656,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 }
                 hera_hooks = apply_lora_prefix_mask(model, per_layer_r_main)
 
-            if epoch > 0 and args.aggregation != 'fedhera':
+            if (epoch > 0 or args.aggregation == 'fedhl') and args.aggregation != 'fedhera':
                 local_client_load_weight(args, model, epoch, global_params=global_params)
 
             active_layers = None
