@@ -941,10 +941,16 @@ def FedHL(selected_clients_set, output_dir, local_dataset_len_dict, epoch, prev_
                     global_delta[base_key] += diff
                 
     # 5. 更新全局模型: W_{t+1} = W_t + Delta
-    new_global_params = copy.deepcopy(prev_global_params)
-    for k, v in new_global_params.items():
+    new_global_params = {}
+    for k, v in prev_global_params.items():
         if k in global_delta:
-            new_global_params[k] = v + global_delta[k]
+            # 关键：使用 .detach().clone() 确保新 Tensor 是 leaf tensor，且内存独立
+            # 将 W_t + Delta 的结果剥离出计算图
+            updated_tensor = (v + global_delta[k]).detach().clone()
+            new_global_params[k] = updated_tensor
+        else:
+            # 对于没有更新的参数，也进行 detach clone 以防万一
+            new_global_params[k] = v.detach().clone()
             
     # 清理缓存
     del layer_svd_cache
