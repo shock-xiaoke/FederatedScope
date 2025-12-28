@@ -295,8 +295,9 @@ class GeneralClient:
             # 5. 返回合并后的指标
             # ---------------------------------------------------------------------
             metrics = {
-                # 新的 Token 级准确率 (修正后应该不再是 0.0)
-                'accuracy': round(float(token_accuracy), 4),
+                "accuracy": round(float(token_accuracy), 4),
+                "rouge1": round(rouge_out["rouge1"], 4),
+                "rouge2": round(rouge_out["rouge2"], 4),
                 "rougeL": round(rouge_out["rougeL"], 4),
                 "rougeLsum": round(rouge_out["rougeLsum"], 4),
                 "bleu": round(bleu_out["bleu"], 4),
