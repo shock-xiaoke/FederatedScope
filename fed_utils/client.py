@@ -222,6 +222,17 @@ class GeneralClient:
             dataloader_num_workers=self.dataloader_num_workers,
             dataloader_pin_memory=use_cuda,
         )
+        rouge_metric = evaluate.load("./evaluate/metrics/rouge/rouge.py")
+        bleu_metric = evaluate.load("./evaluate/metrics/bleu")
+        meteor_metric = evaluate.load("./evaluate/metrics/meteor")
+        nist_metric = evaluate.load("./evaluate/metrics/nist_mt")
+        try:
+            from pycocoevalcap.cider.cider import Cider
+            cider_scorer = Cider()
+        except Exception:
+            cider_scorer = None
+            logging.warning("CIDEr unavailable (install pycocoevalcap).")
+        
         def compute_metrics(pred):
             # ---------------------------------------------------------------------
             # 1. 预处理：获取 Logits 和 Labels
@@ -270,24 +281,31 @@ class GeneralClient:
             pred_str = self.tokenizer.batch_decode(shift_preds, skip_special_tokens=True)
             label_str = self.tokenizer.batch_decode(clean_labels, skip_special_tokens=True)
 
-            # 计算 ROUGE (加载本地或者在线 metrics)
-            # 确保你的路径 './evaluate/metrics/rouge/rouge.py' 是正确的
-            rouge = evaluate.load('./evaluate/metrics/rouge/rouge.py')
-            rouge_output = rouge.compute(predictions=pred_str, references=label_str, use_aggregator=True)
+            rouge_out = rouge_metric.compute(predictions=pred_str, references=label_str, use_aggregator=True)
+            bleu_out = bleu_metric.compute(predictions=pred_str, references=label_str)
+            meteor_out = meteor_metric.compute(predictions=pred_str, references=label_str)
+            nist_out = nist_metric.compute(predictions=pred_str, references=label_str)
+            cider_score = None
+            if cider_scorer is not None:
+                gts = {i: [ref] for i, ref in enumerate(label_str)}
+                res = {i: [hyp] for i, hyp in enumerate(pred_str)}
+                cider_score, _ = cider_scorer.compute_score(gts, res)
 
             # ---------------------------------------------------------------------
             # 5. 返回合并后的指标
             # ---------------------------------------------------------------------
-            return {
+            metrics = {
                 # 新的 Token 级准确率 (修正后应该不再是 0.0)
                 'accuracy': round(float(token_accuracy), 4),
-                
-                # 原有的 ROUGE 指标
-                'rouge1': round(rouge_output["rouge1"], 4),
-                'rouge2': round(rouge_output["rouge2"], 4),
-                'rougeL': round(rouge_output["rougeL"], 4),
-                'rougeLsum': round(rouge_output["rougeLsum"], 4),
+                "rougeL": round(rouge_out["rougeL"], 4),
+                "rougeLsum": round(rouge_out["rougeLsum"], 4),
+                "bleu": round(bleu_out["bleu"], 4),
+                "meteor": round(meteor_out["meteor"], 4),
+                "nist": round(nist_out["nist_mt"], 4),
             }
+            if cider_score is not None:
+                metrics["cider"] = round(float(cider_score), 4)
+            return metrics
 
         tester = transformers.Trainer(
             model=self.model,
