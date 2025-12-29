@@ -126,10 +126,12 @@ def modify_adapter(peft_model, adapter_name, modify_module_rank=None, layer_dict
                 alpha = r
             else:
                 alpha = lora_alpha
+            
             if key in name and isinstance(module, peft.tuners.lora.Linear):
-                module.update_layer(adapter_name, r, alpha, lora_dropout, init_lora_weights)
+                module.update_layer(adapter_name, r, alpha, lora_dropout, init_lora_weights, use_rslora=False)
+            
             if key in name and isinstance(module, peft.tuners.lora.Linear8bitLt):
-                module.update_layer(adapter_name, r, alpha, lora_dropout, init_lora_weights)
+                module.update_layer(adapter_name, r, alpha, lora_dropout, init_lora_weights, use_rslora=False)
 
 
 # fed_utils/adaptive_peft.py (append)
