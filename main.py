@@ -120,7 +120,12 @@ def extract_lora_layer_specs(model, target_modules):
         weight = getattr(module, "weight", None)
         if weight is None or not hasattr(weight, "shape") or len(weight.shape) < 2:
             continue
-        d_out, d_in = int(weight.shape[0]), int(weight.shape[1])
+        
+        if module.__class__.__name__ == 'Conv1D':
+            d_out, d_in = int(weight.shape[1]), int(weight.shape[0])
+        else:
+            d_out, d_in = int(weight.shape[0]), int(weight.shape[1])
+            
         base_key = f"base_model.model.{name}.lora"  # Mirror PEFT naming consumed downstream.
         layer_specs[base_key] = {"d_out": d_out, "d_in": d_in}
     return layer_specs
