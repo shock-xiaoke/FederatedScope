@@ -285,6 +285,9 @@ def read_options():
     parser.add_argument('--use_atw', action='store_true', default=False,
                         help='Enable Adaptive Tail Warm-up (ATW) for FedHera. '
                              'If False, lambda is fixed to 1.0 (Static Tail).')
+    parser.add_argument('--calc_drift', action='store_true', default=False,
+                        help='Whether to calculate drift against a high-rank Oracle (Very slow!).')
+    parser.add_argument('--oracle_rank', default=256, type=int, help='Rank for the Oracle baseline.')
 
     args = parser.parse_args()
     if isinstance(args.ablation, str) and args.ablation.lower() == "none":
@@ -689,6 +692,20 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             logging.info("Local training starts ... ")
             local_train_result = client.train()
             local_train_results += float(local_train_result['eval_loss']) * local_dataset_len_dict[client_id]
+
+            if (epoch > 0) and args.calc_drift:
+                if k == 0: 
+                    try:
+                        drift_val = client.compute_oracle_drift(
+                            global_params=global_params, 
+                            oracle_r=args.oracle_rank,
+                            lora_alpha=args.lora_alpha
+                        )
+                        logging.info(f"[DriftMetrics] Epoch {epoch}, Algorithm {args.aggregation}, Drift {drift_val}")
+                        # 你可以将这个值存到 list 里最后画图
+                    except RuntimeError as e:
+                        logging.error(f"OOM during Oracle training: {e}")
+                        torch.cuda.empty_cache()
 
             logging.info("\nTerminating the local training of Client_{}".format(client_id))
             model, local_dataset_len_dict, previously_selected_clients_set, last_client_id = client.terminate_local_training(

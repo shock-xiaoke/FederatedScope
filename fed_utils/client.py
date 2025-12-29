@@ -37,6 +37,150 @@ class GeneralClient:
         self.pin_memory = torch.cuda.is_available()
         self.active_lora_layers = None if active_lora_layers is None else set(active_lora_layers)
 
+    def compute_oracle_drift(self, global_params, oracle_r=4096, lora_alpha=16):
+        """
+        计算当前训练好的 Low-Rank 更新与 High-Rank Oracle 更新之间的差距。
+        Reference: || Delta_W_method - Delta_W_oracle ||_F / || Delta_W_oracle ||_F
+        """
+        logging.info(f"Client {self.client_id}: Computing Oracle Drift (r={oracle_r})...")
+        
+        # 1. 缓存当前算法训练出的权重 (Method Weights)
+        # 我们需要将其转换为 Dense Delta: (BA * scale)
+        method_deltas = {}
+        target_modules = set() # 记录哪些层被训练了
+        
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if "lora_A" in name and "default" not in name: # 假设当前 adapter 是 active 的
+                    # name e.g., base_model.model.layers.0.self_attn.q_proj.lora_A.local.weight
+                    base_key = ".".join(name.split(".")[:-3]) + ".lora"
+                    target_modules.add(base_key)
+                    
+                    # 找到对应的 B
+                    key_B = name.replace("lora_A", "lora_B")
+                    param_B = self.model.get_parameter(key_B)
+                    
+                    # 计算 Low-Rank Delta
+                    # W_delta = B @ A * (alpha / r)
+                    r = param.shape[0]
+                    scale = lora_alpha / r
+                    
+                    # shape: B=[d_out, r], A=[r, d_in] -> [d_out, d_in]
+                    delta = (param_B @ param) * scale
+                    method_deltas[base_key] = delta.detach().cpu()  # 移至 CPU 节省显存
+
+        # 2. 回滚模型到初始状态 (Global State)
+        # 注意：我们需要保存当前的 state_dict 以便最后恢复
+        current_state_dict = {k: v.cpu() for k, v in self.model.state_dict().items()}
+        
+        # 加载初始全局参数 (这会重置 LoRA 参数为本轮初始状态，或者对于 Oracle 来说，它是基座)
+        # 实际上，我们需要一个新的干净的 Adapter。
+        # 最简单的方法：Unload 当前 Adapter -> 加载新 Adapter -> Train -> Unload -> Reload 旧 Adapter
+        
+        # 3. 切换到 Oracle Adapter
+        from peft import LoraConfig, get_peft_model
+        
+        # 卸载当前 adapter (逻辑上屏蔽即可，PEFT 支持多 adapter)
+        adapter_name = "oracle_adapter"
+        
+        # 提取 target_modules 的简写名 (e.g. q_proj, v_proj) 用于 Config
+        # 这是一个简化处理，假设所有层结构一致
+        target_module_names = list(set([k.split(".")[-2] for k in method_deltas.keys()]))
+        
+        oracle_config = LoraConfig(
+            r=oracle_r,
+            lora_alpha=lora_alpha, # Alpha 通常设为 r 或 16，保持一致性即可，这里建议 alpha=r 以便 scale=1，或者保持 16
+            target_modules=target_module_names,
+            lora_dropout=0.0,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        
+        # 添加新的 Adapter
+        self.model.add_adapter(adapter_name, oracle_config)
+        self.model.set_adapter(adapter_name)
+        
+        # 确保 Oracle 是可训练的
+        for n, p in self.model.named_parameters():
+            if adapter_name in n:
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+                
+        # 4. 训练 Oracle
+        # 重建 Trainer，因为参数变了
+        # 为了速度，Oracle 可以训练较少的 step，但为了公平，应该保持 epoch 一致
+        # 这里复用 build_local_trainer 的参数，但需要重新初始化 optimizer
+        self.build_local_trainer(
+            self.tokenizer,
+            self.train_args.per_device_train_batch_size,
+            self.train_args.gradient_accumulation_steps,
+            self.train_args.num_train_epochs, # 保持 epoch 一致
+            self.train_args.learning_rate,
+            self.train_args.group_by_length,
+            self.train_args.warmup_steps
+        )
+        
+        # 开始训练 Oracle
+        self.local_trainer.train()
+        
+        # 5. 计算 Oracle Delta 并 计算距离
+        total_drift = 0.0
+        total_oracle_norm = 0.0
+        
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if adapter_name in name and "lora_A" in name:
+                    base_key = ".".join(name.split(".")[:-3]) + ".lora"
+                    
+                    if base_key not in method_deltas:
+                        continue
+                        
+                    key_B = name.replace("lora_A", "lora_B")
+                    param_B = self.model.get_parameter(key_B)
+                    
+                    r = param.shape[0]
+                    scale = lora_alpha / r
+                    
+                    # Delta Oracle
+                    delta_oracle = (param_B @ param) * scale
+                    delta_oracle = delta_oracle.cpu()
+                    
+                    delta_method = method_deltas[base_key]
+                    
+                    # 计算 Frobenius Norm
+                    # Diff
+                    diff = torch.norm(delta_method - delta_oracle, p='fro') ** 2
+                    # Oracle Norm
+                    oracle_norm = torch.norm(delta_oracle, p='fro') ** 2
+                    
+                    total_drift += diff.item()
+                    total_oracle_norm += oracle_norm.item()
+        
+        # 最终指标
+        import math
+        relative_drift = math.sqrt(total_drift) / (math.sqrt(total_oracle_norm) + 1e-9)
+        
+        # 6. 清理现场
+        # 删除 Oracle adapter
+        self.model.delete_adapter(adapter_name)
+        
+        # 恢复原来的 Weights (重新加载之前的 state_dict)
+        # 注意：self.model.load_state_dict(current_state_dict) 可能会有 strict 问题
+        # 更安全的方式是切回 'local' (或 'default') adapter 并把参数赋回去
+        self.model.set_adapter("local") 
+        # 将参数从 cpu 拷回 gpu
+        # 实际上 PEFT 的 delete_adapter 应该已经切回去了，但为了保险，我们要恢复之前训练好的值
+        keys = self.model.load_state_dict(current_state_dict, strict=False)
+        
+        # 释放内存
+        del method_deltas
+        del current_state_dict
+        torch.cuda.empty_cache()
+        
+        logging.info(f"Client {self.client_id} Drift Result: {relative_drift:.4f}")
+        return relative_drift
+    
     def generate_and_tokenize_prompt(self, data_point):
         full_prompt = self.prompter.generate_prompt(
             data_point["instruction"],
