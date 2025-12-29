@@ -228,40 +228,34 @@ class GeneralClient:
                             lambd=None,
                             reg=None):
         
-        def compute_metrics(pred):
-            # 获取 Logits 和 Labels
-            logits = pred.predictions
-            # 如果 logits 是 tuple (比如包含 past_key_values)，取第一个元素
+        def preprocess_logits_for_metrics(logits, labels):
+            """
+            在缓存 logits 之前先做 argmax，极大幅度节省显存。
+            Llama-3 vocab=128k, float16 -> argmax int64 节省约 25万倍显存
+            """
             if isinstance(logits, tuple):
+                # 模型可能返回 (logits, past_key_values)
                 logits = logits[0]
+            # 直接返回预测的 token ID，抛弃庞大的概率分布
+            return logits.argmax(dim=-1)
 
+        def compute_metrics(pred):
+            pred_ids = pred.predictions  
             labels_ids = pred.label_ids
 
-            # Argmax 获取预测的 Token ID [Batch, Seq_Len]
-            pred_ids = np.argmax(logits, axis=-1)
+            # Shift 操作 (Causal LM 的标准操作)
+            shift_preds = pred_ids[:, :-1]
+            shift_labels = labels_ids[:, 1:]
 
-            # -----------------------------------------------------------
-            # 【关键修复】Shift 操作：对齐预测和标签
-            # Causal LM 中，位置 t 的 Logit 预测的是 t+1 的 Label
-            # -----------------------------------------------------------
-            shift_preds = pred_ids[:, :-1]  # 预测值截掉最后一位
-            shift_labels = labels_ids[:, 1:]  # 标签值截掉第一位
-
-            # 创建掩码：忽略 padding 和 label 为 -100 的部分
-            # pad_token_id 通常也是 -100 (在 DataCollator 中处理过) 或者 tokenizer.pad_token_id
             mask = (shift_labels != -100)
-
-            # 计算 Token-level Accuracy
-            # 只有在 mask 为 True 的位置才计算是否相等
+            
+            # 计算准确率
             matches = (shift_preds == shift_labels) & mask
             correct = matches.sum()
             total_valid_tokens = mask.sum()
-
+            
             accuracy = correct / max(1, total_valid_tokens)
-
-            return {
-                'accuracy': round(float(accuracy), 4),
-            }
+            return {'accuracy': round(float(accuracy), 4)}
 
         use_cuda = torch.cuda.is_available()
         major, _ = torch.cuda.get_device_capability(0) if use_cuda else (0, 0)
@@ -328,7 +322,8 @@ class GeneralClient:
                                                       padding=True
                                                   ),
                                                   optimizers=(optimizer, scheduler),
-                                                  compute_metrics=compute_metrics
+                                                  compute_metrics=compute_metrics,
+                                                  preprocess_logits_for_metrics=preprocess_logits_for_metrics
                                                   )
 
     def initiate_local_training(self):
@@ -377,25 +372,16 @@ class GeneralClient:
         except Exception:
             cider_scorer = None
             logging.warning("CIDEr unavailable (install pycocoevalcap).")
-        
-        def compute_metrics(pred):
-            # ---------------------------------------------------------------------
-            # 1. 预处理：获取 Logits 和 Labels
-            # ---------------------------------------------------------------------
-            logits = pred.predictions
-            # 如果 logits 是 tuple (比如包含 past_key_values)，取第一个元素
+
+        def preprocess_logits_for_metrics(logits, labels):
             if isinstance(logits, tuple):
                 logits = logits[0]
-            
-            # 获取原始的 ID
-            pred_ids = np.argmax(logits, axis=-1)
-            labels_ids = pred.label_ids # 这里的 labels 包含 -100
+            return logits.argmax(dim=-1)
+        
+        def compute_metrics(pred):
+            pred_ids = pred.predictions 
+            labels_ids = pred.label_ids
 
-            # ---------------------------------------------------------------------
-            # 2. 关键修复：Shift 操作 (对齐预测和标签)
-            # ---------------------------------------------------------------------
-            # Causal LM 中，位置 t 的 Logit 预测的是 t+1 的 Label
-            # 所以我们需要把 预测值左移 (去掉最后一位) 和 标签值右移 (去掉第一位) 来对齐
             shift_preds = pred_ids[:, :-1]
             shift_labels = labels_ids[:, 1:]
 
@@ -459,7 +445,8 @@ class GeneralClient:
             data_collator=transformers.DataCollatorForSeq2Seq(
                 self.tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
             ),
-            compute_metrics=compute_metrics
+            compute_metrics=compute_metrics,
+            preprocess_logits_for_metrics=preprocess_logits_for_metrics
         )
         eval_dataset = self.local_eval_dataset
         eval_results = tester.evaluate(eval_dataset)
