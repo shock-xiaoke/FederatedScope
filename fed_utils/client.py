@@ -381,6 +381,8 @@ class GeneralClient:
         def compute_metrics(pred):
             pred_ids = pred.predictions 
             labels_ids = pred.label_ids
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            pred_ids = np.where(pred_ids != -100, pred_ids, pad_token_id)
 
             shift_preds = pred_ids[:, :-1]
             shift_labels = labels_ids[:, 1:]
