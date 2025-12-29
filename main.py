@@ -307,6 +307,7 @@ def model_and_tokenizer(global_model, device_map='cuda'):
     # use_reentrant=False 是新版推荐设置，避免警告和潜在显存问题
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.config.use_cache = False
+    model.enable_input_require_grads()
 
     # 2. 加载 Tokenizer
     # Llama-3 的 tokenizer 不需要 use_fast=False 强制降级，新版 fast tokenizer 已经很稳定

@@ -294,7 +294,9 @@ class GeneralClient:
                 else:
                     base_key = '.'.join(name.split('.')[:-3]) + '.lora'
                     p.requires_grad = base_key in active_set
+
         lora_params = [p for n, p in self.model.named_parameters() if ('lora_' in n and p.requires_grad)]
+        
         if len(lora_params) == 0:
             raise ValueError("No LoRA parameters found to optimize. Ensure adapters are added via get_peft_model.")
 
