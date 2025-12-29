@@ -227,18 +227,7 @@ class GeneralClient:
                             warmup=0,
                             lambd=None,
                             reg=None):
-        try:
-            # 尝试从 bnb 导入，如果失败回退到 torch
-            from bitsandbytes.optim import AdamW8bit # 注意：通常建议用 AdamW8bit 而不是 Adam8bit
-            optimizer = AdamW8bit(lora_params, lr=local_learning_rate, weight_decay=0.0)
-        except ImportError:
-            try:
-                from bitsandbytes.optim import Adam8bit
-                optimizer = Adam8bit(lora_params, lr=local_learning_rate, weight_decay=0.0)
-            except Exception as e:
-                print(f"Failed to load 8bit optimizer: {e}. Fallback to torch.optim.AdamW")
-                optimizer = torch.optim.AdamW(lora_params, lr=local_learning_rate, weight_decay=0.0)
-
+        
         def compute_metrics(pred):
             # 获取 Logits 和 Labels
             logits = pred.predictions
