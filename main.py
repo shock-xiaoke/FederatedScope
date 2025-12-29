@@ -1,15 +1,5 @@
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-try:
-    # For older transformers versions, register newer model types on the fly.
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-    try:
-        from transformers.models.llama.configuration_llama import LlamaConfig
-    except Exception:
-        LlamaConfig = None
-except Exception:
-    CONFIG_MAPPING = None
-    LlamaConfig = None
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -295,57 +285,48 @@ def read_options():
     return args
 
 
+# [修改] main.py 中的 model_and_tokenizer 函数
+
 def model_and_tokenizer(global_model, device_map='cuda'):
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     global_model,
-    #     torch_dtype=torch.bfloat16,
-    #     device_map=device_map,
-    #     trust_remote_code=True,
-    # )
-    if CONFIG_MAPPING is not None and LlamaConfig is not None:
-        model_id_lower = str(global_model).lower()
-        if "mistral" in model_id_lower and "mistral" not in CONFIG_MAPPING:
-            try:
-                if hasattr(CONFIG_MAPPING, "register"):
-                    CONFIG_MAPPING.register("mistral", LlamaConfig)
-                else:
-                    CONFIG_MAPPING._extra_content["mistral"] = LlamaConfig
-            except Exception:
-                pass
-    # Accept friendly strings to force a single-GPU placement.
+    # 处理 device_map 参数
     map_arg = device_map
     if isinstance(device_map, str) and device_map.lower() in ["cuda", "gpu", "single", "0"]:
         map_arg = {"": 0}
 
+    # 1. 加载模型：增加 attn_implementation="flash_attention_2"
+    # Llama-3.2 强烈建议使用 bfloat16 和 Flash Attention 2
     model = AutoModelForCausalLM.from_pretrained(
         global_model,
         device_map=map_arg,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",  # [新增] 适配 Llama-3.2
     )
-    model.gradient_checkpointing_enable()
+    
+    # 启用梯度检查点时的参数更新
+    # use_reentrant=False 是新版推荐设置，避免警告和潜在显存问题
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.config.use_cache = False
-    # For some newer models (e.g., Mistral) and older `tokenizers` versions,
-    # the fast tokenizer JSON can be incompatible. Force the slow tokenizer
-    # to avoid Rust `tokenizers` version issues.
+
+    # 2. 加载 Tokenizer
+    # Llama-3 的 tokenizer 不需要 use_fast=False 强制降级，新版 fast tokenizer 已经很稳定
     tokenizer = AutoTokenizer.from_pretrained(
         global_model,
         trust_remote_code=True,
-        use_fast=False,
+        use_fast=True, # [建议] 改为 True，除非显存非常紧张
+        padding_side="left" # Decoder-only 模型通常左填充
     )
-    model_type = getattr(model.config, "model_type", "").lower()
+    
+    # 3. 修复 Pad Token (关键)
+    # Llama-3.2 的 tokenizer 通常没有默认 pad_token_id，或者 pad_token_id 是一个特殊保留位
     if tokenizer.pad_token_id is None:
-        # For GPT-2-style models, padding with EOS is more stable.
-        if model_type in ["gpt2"]:
-            if tokenizer.eos_token is not None:
-                tokenizer.pad_token = tokenizer.eos_token
-            elif tokenizer.bos_token is not None:
-                tokenizer.pad_token = tokenizer.bos_token
-            else:
-                tokenizer.pad_token_id = 0
+        if tokenizer.eos_token_id is not None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+            print(f"Warning: pad_token_id was None, set to eos_token_id: {tokenizer.eos_token_id}")
         else:
+            # 万一连 EOS 都没有（极少见），设为 0
             tokenizer.pad_token_id = 0
-    tokenizer.padding_side = "left"
+            
     return model, tokenizer
 
 
