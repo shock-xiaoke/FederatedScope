@@ -336,7 +336,7 @@ class GeneralClient:
             (name, param.detach()) for name, param in self.model.named_parameters() if "lora" in name)
         self.model.state_dict = (
             lambda instance, *_, **__: get_peft_model_state_dict(
-                instance, self.params_dict_new, "lora"
+                instance, self.params_dict_new, "local" 
             )
         ).__get__(self.model, type(self.model))
 
