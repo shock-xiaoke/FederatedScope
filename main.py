@@ -277,7 +277,7 @@ def read_options():
                              'If False, lambda is fixed to 1.0 (Static Tail).')
     parser.add_argument('--calc_drift', action='store_true', default=False,
                         help='Whether to calculate drift against a high-rank Oracle (Very slow!).')
-    parser.add_argument('--oracle_rank', default=256, type=int, help='Rank for the Oracle baseline.')
+    parser.add_argument('--oracle_rank', default=512, type=int, help='Rank for the Oracle baseline.')
 
     args = parser.parse_args()
     if isinstance(args.ablation, str) and args.ablation.lower() == "none":
