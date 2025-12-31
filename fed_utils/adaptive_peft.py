@@ -86,7 +86,7 @@ def distribute_weight_fast(weighted_single_weights, config_local):
                     rank_dict[key] = [val[key]]
 
     for key in tqdm(weighted_single_weights.keys()):
-        W_cpu = weighted_single_weights[key].detach().to('cpu')
+        W_cpu = weighted_single_weights[key].detach().to(device='cpu', dtype=torch.float32)
         u, s, vT = torch.linalg.svd(W_cpu, full_matrices=False)
         for layer, rank_lst in rank_dict.items():
             if layer in key:
