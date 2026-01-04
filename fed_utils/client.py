@@ -160,6 +160,7 @@ class GeneralClient:
         # 最终指标
         import math
         relative_drift = math.sqrt(total_drift) / (math.sqrt(total_oracle_norm) + 1e-9)
+        absolute_drift = math.sqrt(total_drift)
         
         # 6. 清理现场
         # 删除 Oracle adapter
@@ -179,6 +180,7 @@ class GeneralClient:
         torch.cuda.empty_cache()
         
         logging.info(f"Client {self.client_id} Drift Result: {relative_drift:.4f}")
+        logging.info(f"Client {self.client_id} Absolute Drift: {absolute_drift:.4f}")
         return relative_drift
     
     def generate_and_tokenize_prompt(self, data_point):
