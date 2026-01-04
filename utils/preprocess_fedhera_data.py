@@ -204,6 +204,32 @@ def _to_fedhera_example_hellaswag(example: Dict[str, Any]) -> Dict[str, Any]:
         "category": "HellaSwag",
     }
 
+def _to_fedhera_example_winogrande(example: Dict[str, Any]) -> Dict[str, Any]:
+    """Map WinoGrande examples to a binary choice style prompt."""
+    sentence = example.get("sentence") or ""
+    opt1 = example.get("option1") or ""
+    opt2 = example.get("option2") or ""
+    
+    # 构造输入：展示句子和两个选项
+    inp = f"Sentence: {sentence}\nOption 1: {opt1}\nOption 2: {opt2}"
+    
+    # 解析答案：WinoGrande 的 answer 通常是 "1" 或 "2"
+    raw_answer = example.get("answer")
+    correct = ""
+    if str(raw_answer) == "1":
+        correct = opt1
+    elif str(raw_answer) == "2":
+        correct = opt2
+        
+    instruction = "Choose the correct option to complete the sentence or resolve the ambiguity."
+    
+    return {
+        "instruction": instruction,
+        "input": inp,
+        "output": correct,
+        "category": "WinoGrande",
+    }
+
 
 def _split_across_clients(
     records: List[Dict[str, Any]],
@@ -322,6 +348,8 @@ def preprocess_task(
         mapper = _to_fedhera_example_piqa
     elif task == "hellaswag":
         mapper = _to_fedhera_example_hellaswag
+    elif task == "winogrande":
+        mapper = _to_fedhera_example_winogrande
     else:
         raise ValueError(f"Unsupported task: {task}")
 
@@ -351,6 +379,7 @@ def parse_args() -> argparse.Namespace:
             "boolq",
             "piqa",
             "hellaswag",
+            "winogrande",
         ],
         help="Which task to preprocess.",
     )
