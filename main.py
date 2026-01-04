@@ -275,6 +275,8 @@ def read_options():
     parser.add_argument('--use_atw', action='store_true', default=False,
                         help='Enable Adaptive Tail Warm-up (ATW) for FedHera. '
                              'If False, lambda is fixed to 1.0 (Static Tail).')
+    parser.add_argument('--atw_temperature', type=float, default=2.0, 
+                        help='Temperature for FedHera ATW (default: 2.0). Higher value = Slower lambda warmup.')
     parser.add_argument('--calc_drift', action='store_true', default=False,
                         help='Whether to calculate drift against a high-rank Oracle (Very slow!).')
     parser.add_argument('--oracle_rank', default=512, type=int, help='Rank for the Oracle baseline.')
@@ -725,7 +727,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 basis_update_every=args.basis_update_every,
                 ablation=args.ablation,
                 lora_alpha=args.lora_alpha,
-                use_atw=args.use_atw  # [新增] 传递参数
+                use_atw=args.use_atw,
+                atw_temperature=args.atw_temperature,
             )
             # adapter_model.bin 可存聚合Wg，便于可视化/对照
             # torch.save(_, os.path.join(output_dir, "adapter_model.bin"))

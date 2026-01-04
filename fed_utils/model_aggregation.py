@@ -452,7 +452,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             fixed_client_ranks=None,
             ablation=None,
             lora_alpha=16,
-            use_atw=False):
+            use_atw=False,
+            atw_temperature=2.0):
     """
     Fed-Hera aggregation:
     1) Merge client adapters into W_global.
@@ -677,8 +678,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             current_round = epoch + 1
             decay = beta ** (epoch - t_hat)
             
-            # Formula: 1 - exp( - (1 + s * beta^(t-that)) * t / 2 )
-            exponent = -1.0 * (1.0 + s_stored * decay) * current_round / 2.0
+            # Formula: 1 - exp( - (1 + s * beta^(t-that)) * t / T_warmup )
+            exponent = -1.0 * (1.0 + s_stored * decay) * current_round / atw_temperature
             lambda_val = 1.0 - math.exp(exponent)
             
             # Clip for safety
