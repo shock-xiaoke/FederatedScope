@@ -452,7 +452,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             fixed_client_ranks=None,
             ablation=None,
             lora_alpha=16,
-            use_atw=False):
+            use_atw=False, 
+            all_client_ids=None):
     """
     Fed-Hera aggregation:
     1) Merge client adapters into W_global.
@@ -618,7 +619,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     round_transmit_bytes = 0.0
     round_compute_bytes = 0.0
 
-    for client_id in selected_clients_set:
+    push_client_ids = all_client_ids if all_client_ids is not None else selected_clients_set
+    for client_id in push_client_ids:
         budgets = client_budgets[int(client_id)]
         B_down_bytes = int(budgets["B_down_MB"] * MB)
         M_bytes = int(budgets["VRAM_MB"] * MB)
