@@ -453,7 +453,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             ablation=None,
             lora_alpha=16,
             use_atw=False,
-            atw_temperature=2.0):
+            atw_temperature=2.0, 
+            all_client_ids=None):
     """
     Fed-Hera aggregation:
     1) Merge client adapters into W_global.
@@ -533,7 +534,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             global_sq_norm += torch.linalg.norm(g_tensor.float()) ** 2
         global_norm = math.sqrt(global_sq_norm)
 
-        for client_id in selected_clients_set:
+        push_client_ids = all_client_ids if all_client_ids is not None else selected_clients_set
+        for client_id in push_client_ids:
             single_output = os.path.join(output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin")
             if not os.path.exists(single_output):
                 continue

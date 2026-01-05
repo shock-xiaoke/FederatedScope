@@ -568,6 +568,16 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
         global_params = distribute_weight_fast(dense_global_params, config_local)
 
     optim = 'sgd' if args.baseline == 'fedavg' else 'adamw_torch'
+    fedhera_default_lora_state = None
+    if args.aggregation == 'fedhera':
+        # Snapshot initial LoRA weights as a global default for cases where no server push exists yet
+        # (e.g., epoch 0 or resumed runs with missing push folders).
+        fedhera_default_lora_state = {
+            k: v.detach().cpu().clone()
+            for k, v in model.state_dict().items()
+            if k.endswith('_A.local.weight') or k.endswith('_B.local.weight')
+        }
+
     fedhello_layer_keys = sorted(FL_training.layer_specs.keys()) if args.aggregation == 'fedhello' else []
     fedhello_active_counts = FL_training.fedhello_active_layer_counts if args.aggregation == 'fedhello' else {}
     if fedhello_active_counts is None:
@@ -610,7 +620,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
 
             local_client_modify_layer(args, epoch, config_local, model, client_id)
 
-            from fed_utils.adaptive_peft import load_weight_fedhera_if_exists, apply_lora_prefix_mask
+            from fed_utils.adaptive_peft import load_weight_fedhera_if_exists, apply_lora_prefix_mask, modify_adapter
             prev_epoch = max(0, epoch - 1)
             pkg, meta = load_weight_fedhera_if_exists(output_dir, client_id, prev_epoch)
             hera_hooks = None
@@ -643,6 +653,24 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                     if not v.get("skip", False)
                 }
                 hera_hooks = apply_lora_prefix_mask(model, per_layer_r_main)
+            else:
+                # No server push found for this client. Reset LoRA to a clean default to avoid
+                # leaking adapter structure/weights from a previously processed client in this process.
+                base_rank = int(getattr(args, 'lora_r', 8))
+                base_rank_map = {m: base_rank for m in getattr(args, 'lora_target_modules', [])}
+                if base_rank_map:
+                    modify_adapter(
+                        model,
+                        'local',
+                        modify_module_rank=base_rank_map,
+                        lora_alpha=getattr(args, 'lora_alpha', 16),
+                        lora_dropout=getattr(args, 'lora_dropout', 0.05),
+                        init_lora_weights=(fedhera_default_lora_state is None),
+                    )
+                if fedhera_default_lora_state is not None:
+                    _ = model.load_state_dict(fedhera_default_lora_state, strict=False)
+                hera_hooks = None
+
 
             if (epoch > 0 or args.aggregation == 'fedhl') and args.aggregation != 'fedhera':
                 local_client_load_weight(args, model, epoch, global_params=global_params)
@@ -729,6 +757,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 lora_alpha=args.lora_alpha,
                 use_atw=args.use_atw,
                 atw_temperature=args.atw_temperature,
+                all_client_ids=list(range(args.num_clients)),
             )
             # adapter_model.bin 可存聚合Wg，便于可视化/对照
             # torch.save(_, os.path.join(output_dir, "adapter_model.bin"))
