@@ -452,7 +452,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             fixed_client_ranks=None,
             ablation=None,
             lora_alpha=16,
-            use_atw=False, 
+            use_atw=False,
+            atw_temperature=2.0, 
             all_client_ids=None):
     """
     Fed-Hera aggregation:
@@ -533,7 +534,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             global_sq_norm += torch.linalg.norm(g_tensor.float()) ** 2
         global_norm = math.sqrt(global_sq_norm)
 
-        for client_id in selected_clients_set:
+        push_client_ids = all_client_ids if all_client_ids is not None else selected_clients_set
+        for client_id in push_client_ids:
             single_output = os.path.join(output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin")
             if not os.path.exists(single_output):
                 continue
@@ -619,8 +621,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     round_transmit_bytes = 0.0
     round_compute_bytes = 0.0
 
-    push_client_ids = all_client_ids if all_client_ids is not None else selected_clients_set
-    for client_id in push_client_ids:
+    push_target_ids = all_client_ids if all_client_ids is not None else selected_clients_set
+    for client_id in push_target_ids:
         budgets = client_budgets[int(client_id)]
         B_down_bytes = int(budgets["B_down_MB"] * MB)
         M_bytes = int(budgets["VRAM_MB"] * MB)
@@ -679,8 +681,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             current_round = epoch + 1
             decay = beta ** (epoch - t_hat)
             
-            # Formula: 1 - exp( - (1 + s * beta^(t-that)) * t / 2 )
-            exponent = -1.0 * (1.0 + s_stored * decay) * current_round / 2.0
+            # Formula: 1 - exp( - (1 + s * beta^(t-that)) * t / T_warmup )
+            exponent = -1.0 * (1.0 + s_stored * decay) * current_round / atw_temperature
             lambda_val = 1.0 - math.exp(exponent)
             
             # Clip for safety
@@ -769,7 +771,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             comp_time_ms += float(rm * (d_in + d_out) * compute_ms_per_param)
 
         if rank_summary:
-            logging.info("[FedHera][epoch %d][client %s] ranks=%s", epoch, str(client_id), rank_summary)
+            rank_summary_top = dict(list(rank_summary.items())[:2])
+            logging.info("[FedHera][epoch %d][client %s] ranks(top2)=%s", epoch, str(client_id), rank_summary_top)
         comm_util = (client_transmit_bytes / float(B_down_bytes)) if B_down_bytes > 0 else 0.0
         comp_util = (comp_time_ms / float(T_ms)) if T_ms > 0 else 0.0
         logging.info(
