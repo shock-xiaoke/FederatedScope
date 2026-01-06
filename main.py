@@ -619,57 +619,57 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             total_data_num += local_dataset_len_dict[client_id]
 
             local_client_modify_layer(args, epoch, config_local, model, client_id)
-
-            from fed_utils.adaptive_peft import load_weight_fedhera_if_exists, apply_lora_prefix_mask, modify_adapter
-            prev_epoch = max(0, epoch - 1)
-            pkg, meta = load_weight_fedhera_if_exists(output_dir, client_id, prev_epoch)
             hera_hooks = None
-            if pkg is not None and meta is not None:
-                per_layer_r_tot = {}
-                for base_key, info in meta.items():
-                    if info.get("skip", False):
-                        continue
-                    rt = int(info.get("r_tot", 0))
-                    if rt <= 0:
-                        continue
-                    module_key = base_key.rsplit(".", 1)[0]
-                    per_layer_r_tot[module_key] = rt
+            if args.aggregation == 'fedhera':
+                from fed_utils.adaptive_peft import load_weight_fedhera_if_exists, apply_lora_prefix_mask, modify_adapter
+                # Find the latest available server push for this client
+                pkg, meta = None, None
+                for e in range(epoch - 1, -1, -1):
+                    pkg_tmp, meta_tmp = load_weight_fedhera_if_exists(output_dir, client_id, e)
+                    if pkg_tmp is not None and meta_tmp is not None:
+                        pkg, meta = pkg_tmp, meta_tmp
+                        break
 
-                if per_layer_r_tot:
-                    modify_adapter(
-                        model,
-                        'local',
-                        modify_module_rank=per_layer_r_tot,
-                        lora_alpha=16,
-                        lora_dropout=0.05,
-                        init_lora_weights=False,
-                    )
+                if pkg is not None and meta is not None:
+                    # 有 Push：加载 Push
+                    per_layer_r_tot = {}
+                    for base_key, info in meta.items():
+                        if info.get("skip", False): continue
+                        rt = int(info.get("r_tot", 0))
+                        if rt <= 0: continue
+                        module_key = base_key.rsplit(".", 1)[0]
+                        per_layer_r_tot[module_key] = rt
 
-                _ = model.load_state_dict(pkg, strict=False)
+                    if per_layer_r_tot:
+                        modify_adapter(
+                            model, 'local', modify_module_rank=per_layer_r_tot,
+                            lora_alpha=16, lora_dropout=0.05, init_lora_weights=False,
+                        )
+                    _ = model.load_state_dict(pkg, strict=False)
 
-                per_layer_r_main = {
-                    k: int(v.get("r_main", 0))
-                    for k, v in meta.items()
-                    if not v.get("skip", False)
-                }
-                hera_hooks = apply_lora_prefix_mask(model, per_layer_r_main)
-            else:
-                # No server push found for this client. Reset LoRA to a clean default to avoid
-                # leaking adapter structure/weights from a previously processed client in this process.
-                base_rank = int(getattr(args, 'lora_r', 8))
-                base_rank_map = {m: base_rank for m in getattr(args, 'lora_target_modules', [])}
-                if base_rank_map:
-                    modify_adapter(
-                        model,
-                        'local',
-                        modify_module_rank=base_rank_map,
-                        lora_alpha=getattr(args, 'lora_alpha', 16),
-                        lora_dropout=getattr(args, 'lora_dropout', 0.05),
-                        init_lora_weights=(fedhera_default_lora_state is None),
-                    )
-                if fedhera_default_lora_state is not None:
-                    _ = model.load_state_dict(fedhera_default_lora_state, strict=False)
-                hera_hooks = None
+                    per_layer_r_main = {k: int(v.get("r_main", 0)) for k, v in meta.items() if not v.get("skip", False)}
+                    hera_hooks = apply_lora_prefix_mask(model, per_layer_r_main)
+                else:
+                    # 无 Push：重置为默认 (修复了这里的 NoneType 错误)
+                    # 使用 config.target_modules 作为更可靠的来源
+                    base_rank = int(getattr(args, 'lora_r', 8))
+                    
+                    # [修复] 优先使用 config 中的 target_modules，因为 args.lora_target_modules 可能是 None
+                    targets = config.target_modules if config and hasattr(config, "target_modules") else (args.lora_target_modules or [])
+                    if isinstance(targets, str): targets = [targets] # 防止是字符串
+                    
+                    base_rank_map = {m: base_rank for m in targets}
+                    
+                    if base_rank_map:
+                        modify_adapter(
+                            model, 'local', modify_module_rank=base_rank_map,
+                            lora_alpha=getattr(args, 'lora_alpha', 16),
+                            lora_dropout=getattr(args, 'lora_dropout', 0.05),
+                            init_lora_weights=(fedhera_default_lora_state is None),
+                        )
+                    if fedhera_default_lora_state is not None:
+                        _ = model.load_state_dict(fedhera_default_lora_state, strict=False)
+                    hera_hooks = None
 
 
             if (epoch > 0 or args.aggregation == 'fedhl') and args.aggregation != 'fedhera':
