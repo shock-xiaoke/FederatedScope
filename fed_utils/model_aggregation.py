@@ -621,7 +621,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     round_transmit_bytes = 0.0
     round_compute_bytes = 0.0
 
-    for client_id in selected_clients_set:
+    push_target_ids = all_client_ids if all_client_ids is not None else selected_clients_set
+    for client_id in push_target_ids:
         budgets = client_budgets[int(client_id)]
         B_down_bytes = int(budgets["B_down_MB"] * MB)
         M_bytes = int(budgets["VRAM_MB"] * MB)
@@ -770,7 +771,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             comp_time_ms += float(rm * (d_in + d_out) * compute_ms_per_param)
 
         if rank_summary:
-            logging.info("[FedHera][epoch %d][client %s] ranks=%s", epoch, str(client_id), rank_summary)
+            rank_summary_top = dict(list(rank_summary.items())[:2])
+            logging.info("[FedHera][epoch %d][client %s] ranks(top)=%s", epoch, str(client_id), rank_summary_top)
         comm_util = (client_transmit_bytes / float(B_down_bytes)) if B_down_bytes > 0 else 0.0
         comp_util = (comp_time_ms / float(T_ms)) if T_ms > 0 else 0.0
         logging.info(
