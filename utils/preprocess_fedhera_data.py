@@ -204,6 +204,26 @@ def _to_fedhera_example_hellaswag(example: Dict[str, Any]) -> Dict[str, Any]:
         "category": "HellaSwag",
     }
 
+def _to_fedhera_example_alpaca(example: Dict[str, Any]) -> Dict[str, Any]:
+    """Map Alpaca (Cleaned) examples to (instruction, input, output)."""
+    # Alpaca already has 'instruction', 'input', and 'output' fields.
+    # We just need to handle cases where input is empty or combine them if needed.
+    
+    instruction = example.get("instruction") or ""
+    inp = example.get("input") or ""
+    output = example.get("output") or ""
+    
+    # Alpaca prompts usually don't need 'input' if it's empty, 
+    # but FedHera format often expects separate fields.
+    # We will keep them as is, consistent with standard Alpaca formatting.
+    
+    return {
+        "instruction": instruction,
+        "input": inp,
+        "output": output,
+        "category": "Alpaca_Cleaned",
+    }
+
 
 def _split_across_clients(
     records: List[Dict[str, Any]],
@@ -322,11 +342,14 @@ def preprocess_task(
         mapper = _to_fedhera_example_piqa
     elif task == "hellaswag":
         mapper = _to_fedhera_example_hellaswag
+    elif task == "alpaca":
+        mapper = _to_fedhera_example_alpaca
     else:
         raise ValueError(f"Unsupported task: {task}")
 
     for ex in ds:
         rec = mapper(ex)
+        # Ensure we have valid instruction/output for training
         if rec["instruction"] and rec["output"]:
             records.append(rec)
 
@@ -351,6 +374,7 @@ def parse_args() -> argparse.Namespace:
             "boolq",
             "piqa",
             "hellaswag",
+            "alpaca",
         ],
         help="Which task to preprocess.",
     )
