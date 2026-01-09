@@ -281,6 +281,19 @@ def read_options():
                         help='Whether to calculate drift against a high-rank Oracle (Very slow!).')
     parser.add_argument('--oracle_rank', default=512, type=int, help='Rank for the Oracle baseline.')
 
+    # --- Evaluation protocol (community metrics) ---
+    parser.add_argument('--eval_protocol', default='auto', type=str,
+                        choices=['auto', 'gen', 'legacy_tf'],
+                        help='Evaluation protocol: gen=use model.generate() metrics, legacy_tf=teacher-forcing argmax decode, auto=choose gen')
+    parser.add_argument('--eval_answer_only_loss', action='store_true', default=False,
+                        help='If set, eval/test loss masks the prompt and computes answer-only NLL (recommended).')
+    parser.add_argument('--eval_max_samples', default=0, type=int,
+                        help='Max eval samples per client for generation-based metrics (0 means all).')
+    parser.add_argument('--eval_gen_batch_size', default=4, type=int,
+                        help='Batch size for generation-based evaluation.')
+    parser.add_argument('--eval_gen_max_new_tokens', default=128, type=int,
+                        help='Max new tokens for generation-based eval (NLG default; math will override to >=256).')
+
     args = parser.parse_args()
     if isinstance(args.ablation, str) and args.ablation.lower() == "none":
         args.ablation = None
@@ -678,17 +691,47 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             active_layers = None
             if fedhello_masks is not None:
                 active_layers = fedhello_masks.get(client_id, [])
-            client = GeneralClient(client_id, model, tokenizer, prompter, data_path, output_dir, cache_dir=args.cache_dir,
-                                   hetero_lora=False, optim=optim, dataloader_num_workers=args.dataloader_num_workers,
-                                   active_lora_layers=active_layers)
+            dataset_tag = os.path.basename(os.path.normpath(args.data_path)).lower()
+
+            client = GeneralClient(
+                client_id, model, tokenizer, prompter, data_path, output_dir,
+                cache_dir=args.cache_dir,
+                hetero_lora=False,
+                optim=optim,
+                dataloader_num_workers=args.dataloader_num_workers,
+                train_on_inputs=args.train_on_inputs,
+                eval_protocol=args.eval_protocol,
+                eval_answer_only_loss=args.eval_answer_only_loss,
+                eval_max_samples=args.eval_max_samples,
+                eval_gen_batch_size=args.eval_gen_batch_size,
+                eval_gen_max_new_tokens=args.eval_gen_max_new_tokens,
+            )
+
 
             logging.info("\nPreparing the local dataset and trainer for Client_{}".format(client_id))
             client.preprare_local_dataset()
 
-            local_eval_result = client.test(epoch, args.local_micro_batch_size)
-            local_eval_results += float(local_eval_result['eval_loss']) * local_dataset_len_dict[client_id]
-            local_eval_rouge_1 += float(local_eval_result['eval_rouge1']) * local_dataset_len_dict[client_id]
-            local_eval_rouge_L += float(local_eval_result['eval_rougeL']) * local_dataset_len_dict[client_id]
+            local_eval_result = client.test(epoch, args.local_micro_batch_size, dataset_tag=dataset_tag)
+            n_i = local_dataset_len_dict[client_id]
+
+            # always have loss (from HF evaluate)
+            if 'eval_loss' in local_eval_result:
+                local_eval_results += float(local_eval_result['eval_loss']) * n_i
+
+            # generation metrics by task
+            if 'eval_accuracy' in local_eval_result:
+                local_eval_acc = locals().get('local_eval_acc', 0.0) + float(local_eval_result['eval_accuracy']) * n_i
+                locals()['local_eval_acc'] = local_eval_acc
+
+            if 'eval_em' in local_eval_result:
+                local_eval_em = locals().get('local_eval_em', 0.0) + float(local_eval_result['eval_em']) * n_i
+                locals()['local_eval_em'] = local_eval_em
+
+            if 'eval_rouge1' in local_eval_result:
+                local_eval_rouge_1 += float(local_eval_result['eval_rouge1']) * n_i
+            if 'eval_rougeL' in local_eval_result:
+                local_eval_rouge_L += float(local_eval_result['eval_rougeL']) * n_i
+
 
             logging.info("Initiating the local training of Client_{}".format(client_id))
 
@@ -827,7 +870,22 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             else:
                 current_count += 1
             if current_count > patience:
-                logging.info(f"Best round is {best_round} with test_rouge_L {best_rouge_L}")
+                # Example logging at end of round
+                global_eval_loss = local_eval_results / max(1, total_data_num)
+                logging.info(f"[Round {epoch}] global_eval_loss={global_eval_loss:.6f}")
+
+                if 'local_eval_acc' in locals():
+                    global_eval_acc = locals()['local_eval_acc'] / max(1, total_data_num)
+                    logging.info(f"[Round {epoch}] global_eval_accuracy={global_eval_acc:.4f}")
+
+                if 'local_eval_em' in locals():
+                    global_eval_em = locals()['local_eval_em'] / max(1, total_data_num)
+                    logging.info(f"[Round {epoch}] global_eval_em={global_eval_em:.4f}")
+
+                if local_eval_rouge_L > 0:
+                    global_eval_rouge_L = local_eval_rouge_L / max(1, total_data_num)
+                    logging.info(f"[Round {epoch}] global_eval_rougeL={global_eval_rouge_L:.4f}")
+
                 # Log final communication / compute statistics before exiting.
                 try:
                     stats = get_traffic_stats()

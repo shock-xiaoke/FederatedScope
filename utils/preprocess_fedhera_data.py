@@ -6,6 +6,44 @@ from typing import List, Dict, Any, Tuple
 import numpy as np
 from datasets import load_dataset, Dataset
 
+import re
+
+_NUM_RE = re.compile(r"(-?\d+/\d+|-?\d*\.\d+|-?\d+)")
+
+def _strip_boxed(s: str) -> str:
+    if s is None:
+        return ""
+    s = s.strip()
+    # remove common latex wrappers
+    s = s.replace("\\boxed", "")
+    s = s.replace("{", "").replace("}", "")
+    return s.strip()
+
+def extract_final_answer(category: str, output: str) -> str:
+    cat = (category or "").lower()
+    out = output or ""
+
+    # GSM8K: prefer ####
+    if cat == "gsm8k":
+        m = re.findall(r"####\s*([^\n]+)", out)
+        if m:
+            return _strip_boxed(m[-1])
+        # fallback: last number
+        m2 = _NUM_RE.findall(out)
+        return _strip_boxed(m2[-1]) if m2 else ""
+
+    # MetaMathQA / Arithmetic / SVAMP: last number-like token, also handle boxed fractions
+    m2 = _NUM_RE.findall(out)
+    if m2:
+        return _strip_boxed(m2[-1])
+
+    # fallback: try 'answer is'
+    m3 = re.findall(r"answer\s+is\s*[:：]?\s*([^\n]+)", out, flags=re.IGNORECASE)
+    if m3:
+        return _strip_boxed(m3[-1])
+
+    return _strip_boxed(out)
+
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -36,6 +74,7 @@ def _to_fedhera_example_mathqa(example: Dict[str, Any]) -> Dict[str, Any]:
         "input": question,
         "output": answer,
         "category": "MetaMathQA",
+        "final_answer": extract_final_answer("MetaMathQA", answer),
     }
 
 
@@ -119,6 +158,7 @@ def _to_fedhera_example_gsm8k(example: Dict[str, Any]) -> Dict[str, Any]:
         "input": question,
         "output": answer,
         "category": "GSM8K",
+        "final_answer": extract_final_answer("GSM8K", answer),
     }
 
 
@@ -162,20 +202,12 @@ def _to_fedhera_example_piqa(example: Dict[str, Any]) -> Dict[str, Any]:
     goal = example.get("goal") or ""
     sol1 = example.get("sol1") or ""
     sol2 = example.get("sol2") or ""
-    label = example.get("label")
-    try:
-        label = int(label)
-    except Exception:
-        label = None
-    correct = sol1 if label == 0 else sol2 if label == 1 else ""
-    inp = f"Goal: {goal}\nSolution 1: {sol1}\nSolution 2: {sol2}"
-    instruction = "Given a goal and two solutions, identify the correct one."
-    return {
-        "instruction": instruction,
-        "input": inp,
-        "output": correct,
-        "category": "PIQA",
-    }
+    label = int(example.get("label"))
+    output = "A" if label == 0 else "B"
+
+    instruction = "Given a goal and two solutions, choose the correct one. Answer with A or B."
+    inp = f"Goal: {goal}\n(A) {sol1}\n(B) {sol2}\nAnswer:"
+    return {"instruction": instruction, "input": inp, "output": output, "category": "PIQA"}
 
 
 def _to_fedhera_example_hellaswag(example: Dict[str, Any]) -> Dict[str, Any]:
@@ -184,24 +216,40 @@ def _to_fedhera_example_hellaswag(example: Dict[str, Any]) -> Dict[str, Any]:
     ctx_b = example.get("ctx_b") or ""
     context = (ctx_a + " " + ctx_b).strip()
     endings = example.get("endings") or []
-    label = example.get("label")
+    label = int(example.get("label"))
     try:
         label = int(label)
     except Exception:
         label = None
-    correct = endings[label] if label is not None and label < len(endings) else ""
     options = []
     for idx, opt in enumerate(endings):
         letter = chr(ord("A") + idx)
         options.append(f"({letter}) {opt}")
     options_text = "\n".join(options)
-    prompt_input = f"Context: {context}\nOptions:\n{options_text}\nChoose the best ending."
-    instruction = "Pick the option (A/B/C/D) that best completes the context."
+    output = chr(ord("A") + label)
+
+    instruction = "Pick the option (A/B/C/D) that best completes the context. Answer with a single letter."
+    prompt_input = f"Context: {context}\nOptions:\n{options_text}\nAnswer:"
+    return {"instruction": instruction, "input": prompt_input, "output": output, "category": "HellaSwag"}
+
+def _to_fedhera_example_winogrande(example: Dict[str, Any]) -> Dict[str, Any]:
+    """Map WinoGrande examples to a binary choice style prompt."""
+    sentence = example.get("sentence") or ""
+    opt1 = example.get("option1") or ""
+    opt2 = example.get("option2") or ""
+    inp = f"Sentence: {sentence}\nOption 1: {opt1}\nOption 2: {opt2}"
+    raw_answer = example.get("answer")
+    correct = ""
+    if str(raw_answer) == "1":
+        correct = opt1
+    elif str(raw_answer) == "2":
+        correct = opt2
+    instruction = "Choose the correct option to complete the sentence or resolve the ambiguity."
     return {
         "instruction": instruction,
-        "input": prompt_input,
+        "input": inp,
         "output": correct,
-        "category": "HellaSwag",
+        "category": "WinoGrande",
     }
 
 def _to_fedhera_example_alpaca(example: Dict[str, Any]) -> Dict[str, Any]:
