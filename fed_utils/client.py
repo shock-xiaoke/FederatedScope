@@ -273,7 +273,7 @@ class GeneralClient:
         major, _ = torch.cuda.get_device_capability(0) if use_cuda else (0, 0)
         use_bf16 = use_cuda and major >= 8
 
-        self.train_args = transformers.TrainingArguments(
+        self.train_args = make_training_arguments(
             per_device_train_batch_size=local_micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=warmup,
@@ -293,6 +293,7 @@ class GeneralClient:
             dataloader_num_workers=self.dataloader_num_workers,
             dataloader_pin_memory=use_cuda,
         )
+
 
         for name, p in self.model.named_parameters():
             if 'lora_' not in name:
@@ -504,7 +505,7 @@ class GeneralClient:
         major, _ = torch.cuda.get_device_capability(0) if use_cuda else (0, 0)
         use_bf16 = use_cuda and major >= 8
 
-        test_args = transformers.TrainingArguments(
+        test_args = make_training_arguments(
             output_dir=self.output_dir,
             do_train=False,
             do_eval=True,
@@ -516,6 +517,7 @@ class GeneralClient:
             dataloader_num_workers=self.dataloader_num_workers,
             dataloader_pin_memory=use_cuda,
         )
+
 
         tester = transformers.Trainer(
             model=self.model,
