@@ -12,6 +12,36 @@ import numpy as np
 import re
 from fractions import Fraction
 from typing import Dict, List, Tuple, Optional
+import inspect
+import transformers
+
+def make_training_arguments(**kwargs):
+    """
+    Build transformers.TrainingArguments in a version-robust way:
+    - filter out unsupported kwargs
+    - rename a few known changed argument names
+    """
+    sig = inspect.signature(transformers.TrainingArguments.__init__)
+    allowed = set(sig.parameters.keys())
+
+    # rename mapping for different transformers versions
+    rename_map = {
+        "evaluation_strategy": "eval_strategy",   # some versions rename/deprecate
+        "save_strategy": "save_strategy",         # keep, but here for symmetry
+        "logging_strategy": "logging_strategy",
+    }
+
+    fixed = dict(kwargs)
+
+    # rename if needed
+    for old, new in rename_map.items():
+        if old in fixed and old not in allowed and new in allowed:
+            fixed[new] = fixed.pop(old)
+
+    # filter unsupported
+    filtered = {k: v for k, v in fixed.items() if k in allowed}
+
+    return transformers.TrainingArguments(**filtered)
 
 
 # -----------------------------
