@@ -261,7 +261,7 @@ def read_options():
                         help='template to generate prompt')
 
     ## LoRA Parameters
-    parser.add_argument('--lora_r', default=8, type=int,
+    parser.add_argument('--lora_r', default=8, type=int, 
                         help='LoRA rank')
     parser.add_argument('--lora_alpha', default=16, type=int,
                         help='LoRA alpha')
@@ -280,6 +280,10 @@ def read_options():
     parser.add_argument('--calc_drift', action='store_true', default=False,
                         help='Whether to calculate drift against a high-rank Oracle (Very slow!).')
     parser.add_argument('--oracle_rank', default=512, type=int, help='Rank for the Oracle baseline.')
+    parser.add_argument('--fedhera_server_agg', default='original', type=str, choices=['original', 'unbiased'],
+        help=("FedHera server-side aggregation. original: W_{t+1}=Σ p_i W_i. unbiased: FedHL-style W_{t+1}=W_t+Σ p_i (W_i^{t+1}-W_t^{r_i}), "
+            "where W_t^{r_i} is the last-round server_push for each client."))
+
 
     # --- Evaluation protocol (community metrics) ---
     parser.add_argument('--eval_protocol', default='auto', type=str,
@@ -798,6 +802,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 basis_update_every=args.basis_update_every,
                 ablation=args.ablation,
                 lora_alpha=args.lora_alpha,
+                server_agg=args.fedhera_server_agg,
                 use_atw=args.use_atw,
                 atw_temperature=args.atw_temperature,
                 all_client_ids=list(range(args.num_clients)),
@@ -861,7 +866,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
 
         global_eval_rouge_L = local_eval_rouge_L / total_data_num
 
-        ### early stop
+        ### early stop 
         if args.early_stop:
             if best_rouge_L < global_eval_rouge_L:
                 best_rouge_L = global_eval_rouge_L
