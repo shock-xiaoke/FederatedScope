@@ -478,6 +478,20 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     5) [ATW] Calculate lambda and Push truncated A/B plus meta back to clients.
     """
     compute_ms_per_param = 1.7e-04
+    server_agg_mode = str(server_agg or "original").lower()
+    prev_dense = None
+    if server_agg_mode == "unbiased":
+        if epoch == 0:
+            logging.info("[FedHera][epoch 0] unbiased requires prev dense cache; fallback to original.")
+            server_agg_mode = "original"
+        else:
+            prev_dense = _load_fedhera_dense_global(output_dir, epoch - 1)
+            if prev_dense is None:
+                logging.warning(
+                    "[FedHera][epoch %d] Missing dense cache for epoch %d; fallback to original.",
+                    epoch, epoch - 1
+                )
+                server_agg_mode = "original"
     
     def _uniform_allocation(layers, bytes_per_col, c_mem_per_col, c_time_per_col,
                             B_down_bytes, M_bytes, T_ms, target_rank=None):
@@ -863,6 +877,7 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
         round_transmit_bytes / MB,
         round_compute_bytes / MB,
     )
+    aggregated = {k: v.detach().cpu() for k, v in aggregated.items()}
     _save_fedhera_dense_global(output_dir, epoch, aggregated)
     return aggregated
 
