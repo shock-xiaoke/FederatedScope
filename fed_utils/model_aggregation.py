@@ -479,22 +479,6 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     5) [ATW] Calculate lambda and Push truncated A/B plus meta back to clients.
     """
     compute_ms_per_param = 1.7e-04
-    server_agg_mode = str(server_agg or "original").lower()
-
-    prev_dense = None
-    if server_agg_mode == "unbiased":
-        if epoch == 0:
-            logging.info("[FedHera][epoch 0] unbiased requires prev dense cache; fallback to original.")
-            server_agg_mode = "original"
-        else:
-            prev_dense = _load_fedhera_dense_global(output_dir, epoch - 1)
-            if prev_dense is None:
-                logging.warning(
-                    "[FedHera][epoch %d] Missing dense cache for epoch %d; fallback to original.",
-                    epoch, epoch - 1
-                )
-                server_agg_mode = "original"
-
     
     def _uniform_allocation(layers, bytes_per_col, c_mem_per_col, c_time_per_col,
                             B_down_bytes, M_bytes, T_ms, target_rank=None):
@@ -538,18 +522,25 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     # 1. Aggregation Phase
     server_agg_mode = str(server_agg or "original").lower()
     if server_agg_mode not in ["original", "unbiased"]:
-        raise ValueError(f"Unsupported FedHera server_agg mode: {server_agg}")
+        raise ValueError(f"Unsupported FedHera server_agg mode: {server_agg_mode}")
 
     prev_dense = None
-    if server_agg_mode == "unbiased" and epoch > 0:
-        prev_dense = _load_fedhera_dense_global(output_dir, epoch - 1)
-        if prev_dense is None:
-            logging.warning(
-                "[FedHera][epoch %d] Unbiased requested but missing dense cache for epoch %d. "
-                "Fallback to original.",
-                epoch, epoch - 1
-            )
+    if server_agg_mode == "unbiased":
+        if epoch == 0:
+            logging.info("[FedHera][epoch 0] unbiased requires prev dense cache; fallback to original.")
             server_agg_mode = "original"
+        else:
+            prev_dense = _load_fedhera_dense_global(output_dir, epoch - 1)
+            if prev_dense is None:
+                logging.warning(
+                    "[FedHera][epoch %d] Missing dense cache for epoch %d; fallback to original.",
+                    epoch, epoch - 1
+                )
+                server_agg_mode = "original"
+
+    if server_agg_mode == "unbiased":
+        assert prev_dense is not None, "prev_dense must exist in unbiased mode"
+
 
     with torch.no_grad():
         if server_agg_mode == "original":
