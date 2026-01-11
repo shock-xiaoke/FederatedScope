@@ -492,6 +492,13 @@ class GeneralClient:
                 "eval_rougeL": round(float(rouge_out.get("rougeL", 0.0)), 4),
                 "eval_rougeLsum": round(float(rouge_out.get("rougeLsum", 0.0)), 4),
             }
+            try:
+                bleu = evaluate.load("./evaluate/metrics/bleu/bleu.py") 
+                ref_lists = [[r] for r in ref_str]
+                bleu_out = bleu.compute(predictions=pred_str, references=ref_lists)
+                out["eval_bleu"] = round(float(bleu_out.get("bleu", 0.0)), 4)
+            except Exception as e:
+                logging.warning(f"BLEU calculation failed: {e}")
             return out
 
         # fallback: return nothing
