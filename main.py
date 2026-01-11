@@ -613,6 +613,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
         local_eval_rouge_1 = 0
         local_eval_rouge_L = 0
         total_data_num = 0
+        local_eval_bleu = 0
         logging.info("\In Epoch " + str(epoch))
         logging.info("\nConducting the client selection")
 
@@ -743,6 +744,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 local_eval_rouge_1 += float(local_eval_result['eval_rouge1']) * n_i
             if 'eval_rougeL' in local_eval_result:
                 local_eval_rouge_L += float(local_eval_result['eval_rougeL']) * n_i
+            if 'eval_bleu' in local_eval_result:
+                local_eval_bleu += float(local_eval_result['eval_bleu']) * n_i
 
 
             logging.info("Initiating the local training of Client_{}".format(client_id))
@@ -904,6 +907,9 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 if local_eval_rouge_L > 0:
                     global_eval_rouge_L = local_eval_rouge_L / max(1, total_data_num)
                     logging.info(f"[Round {epoch}] global_eval_rougeL={global_eval_rouge_L:.4f}")
+                if local_eval_bleu > 0:
+                    global_eval_bleu = local_eval_bleu / max(1, total_data_num)
+                    logging.info(f"[Round {epoch}] global_eval_bleu={global_eval_bleu:.4f}")
 
                 # Log final communication / compute statistics before exiting.
                 try:
