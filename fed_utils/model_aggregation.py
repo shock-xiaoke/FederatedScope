@@ -469,7 +469,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             use_atw=False,
             atw_temperature=2.0, 
             all_client_ids=None,
-            server_agg: str = "original"):
+            server_agg: str = "original", 
+            prev_global_params=None):
     """
     Fed-Hera aggregation:
     1) Merge client adapters into W_global.
@@ -526,10 +527,9 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
 
     prev_dense = None
     if server_agg_mode == "unbiased":
-        if epoch == 0:
-            logging.info("[FedHera][epoch 0] unbiased requires prev dense cache; fallback to original.")
-            server_agg_mode = "original"
-        else:
+        if prev_global_params is not None:
+            prev_dense = prev_global_params
+        elif epoch > 0:
             prev_dense = _load_fedhera_dense_global(output_dir, epoch - 1)
             if prev_dense is None:
                 logging.warning(
@@ -537,6 +537,9 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                     epoch, epoch - 1
                 )
                 server_agg_mode = "original"
+        else:
+            logging.info("[FedHera][epoch 0] unbiased requires prev dense cache; fallback to original.")
+            server_agg_mode = "original"
 
     if server_agg_mode == "unbiased":
         assert prev_dense is not None, "prev_dense must exist in unbiased mode"
