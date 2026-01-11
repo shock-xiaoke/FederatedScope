@@ -197,7 +197,6 @@ def load_weight_fedhera_if_exists(output_dir, client_id, epoch):
         state = torch.load(model_path, map_location="cpu")
         with open(meta_path, "r") as f:
             meta = json.load(f)
-            
         # [新增] 应用 ATW Lambda Scaling
         # 我们需要在加载前修改 state 中的权重
         # 逻辑：对于每一层，获取 r_main 和 lambda。
@@ -214,32 +213,32 @@ def load_weight_fedhera_if_exists(output_dir, client_id, epoch):
                 continue
             
             lambda_val = info.get("lambda", 1.0)
-            if lambda_val >= 0.999: # 接近 1 则不处理
+            if lambda_val >= 0.999:
                 continue
                 
             r_main = int(info.get("r_main", 0))
             r_tot = int(info.get("r_tot", 0))
             
-            if r_main >= r_tot: # 没有 tail
+            if r_main >= r_tot:
                 continue
 
-            # 找到对应的 tensor key
-            # meta key 是 base key (e.g. ...lora), state key 是 ...lora_A.local.weight
             key_A = layer_key + "_A.local.weight"
             key_B = layer_key + "_B.local.weight"
             
             if key_A in state and key_B in state:
-                # Scale Factor
-                # h = Wx + s * (Main + lambda * Tail)
-                # Tail_new = Tail_old * lambda
-                # 由于 A 和 B 是分解的，我们将 A_tail 和 B_tail 都乘以 sqrt(lambda)
+                tensor_A = state[key_A]
+                tensor_B = state[key_B]
+                
+                current_r_A = tensor_A.shape[0]
+                current_r_B = tensor_B.shape[1]
+                
+                if r_main >= current_r_A or r_main >= current_r_B:
+                    continue
+
                 scale = lambda_val ** 0.5
                 
-                # Process A: Shape [r, d_in], Tail is rows [r_main:]
-                state[key_A][r_main:, :] *= scale
-                
-                # Process B: Shape [d_out, r], Tail is cols [:, r_main:]
-                state[key_B][:, r_main:] *= scale
+                tensor_A[r_main:, :].mul_(scale)
+                tensor_B[:, r_main:].mul_(scale)
                 
         return state, meta
         

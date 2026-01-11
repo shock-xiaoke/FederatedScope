@@ -571,6 +571,15 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
     else:
         start_epoch = 0
         global_params = None
+
+    if (args.aggregation == 'fedhl' or (args.aggregation == 'fedhera' and args.fedhera_server_agg == 'unbiased')) and dense_global_params is None:
+        logging.info(f"[{args.aggregation}] Initializing dense global LoRA-update W0 as ZEROS (delta adapter).")
+        dense_global_params = {}
+
+        for key, spec in FL_training.layer_specs.items():
+            d_out = int(spec.get("d_out", 0))
+            d_in  = int(spec.get("d_in", 0))
+            dense_global_params[key] = torch.zeros((d_out, d_in), dtype=torch.float32)
     
     if args.aggregation == 'fedhl' and dense_global_params is None:
         logging.info("[FedHL] Initializing dense global LoRA-update W0 as ZEROS (delta adapter).")
@@ -790,7 +799,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             if args.save_model:
                 torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
         elif args.aggregation == 'fedhera':
-            FedHera(
+            new_global_params =FedHera(
                 selected_clients_set,
                 output_dir,
                 local_dataset_len_dict,
@@ -807,7 +816,15 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 atw_temperature=args.atw_temperature,
                 all_client_ids=list(range(args.num_clients)),
                 server_agg=args.fedhera_server_agg,
+                prev_global_params=dense_global_params if args.fedhera_server_agg == 'unbiased' else None
             )
+            if args.fedhera_server_agg == 'unbiased':
+                if new_global_params is not None:
+                    dense_global_params = new_global_params
+                    # 可选：如果需要计算 Drift，这里可以将 dense 转回 SVD 形式赋给 global_params
+                    # global_params = distribute_weight_fast(dense_global_params, config_local) 
+                else:
+                    logging.warning("FedHera returned None in unbiased mode! Check fed_utils implementation.")
             # adapter_model.bin 可存聚合Wg，便于可视化/对照
             # torch.save(_, os.path.join(output_dir, "adapter_model.bin"))
         elif args.aggregation == 'fedhello':
