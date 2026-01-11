@@ -280,6 +280,11 @@ def read_options():
     parser.add_argument('--calc_drift', action='store_true', default=False,
                         help='Whether to calculate drift against a high-rank Oracle (Very slow!).')
     parser.add_argument('--oracle_rank', default=512, type=int, help='Rank for the Oracle baseline.')
+    parser.add_argument('--fedhera_server_agg', default='original', type=str, choices=['original', 'unbiased'],
+        help=(
+            "FedHera server-side aggregation. original: W_{t+1}=Σ p_i W_i. unbiased: FedHL-style W_{t+1}=W_t+Σ p_i (W_i^{t+1}-W_t^{r_i}), "
+            "where W_t^{r_i} is the last-round server_push for each client."))
+
 
     # --- Evaluation protocol (community metrics) ---
     parser.add_argument('--eval_protocol', default='auto', type=str,
@@ -801,6 +806,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 use_atw=args.use_atw,
                 atw_temperature=args.atw_temperature,
                 all_client_ids=list(range(args.num_clients)),
+                server_agg=args.fedhera_server_agg,
             )
             # adapter_model.bin 可存聚合Wg，便于可视化/对照
             # torch.save(_, os.path.join(output_dir, "adapter_model.bin"))
