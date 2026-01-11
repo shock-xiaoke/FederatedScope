@@ -442,6 +442,19 @@ def FlexLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch, cl
 
 import json
 from .rank_allocator import allocate_r_tot_for_client, allocate_r_main_for_client
+def _fedhera_dense_global_path(output_dir: str, epoch: int) -> str:
+    return os.path.join(output_dir, f"fedhera_dense_global_epoch_{epoch}.pt")
+
+def _load_fedhera_dense_global(output_dir: str, epoch: int):
+    path = _fedhera_dense_global_path(output_dir, epoch)
+    if os.path.exists(path):
+        return torch.load(path, map_location="cpu")
+    return None
+
+def _save_fedhera_dense_global(output_dir: str, epoch: int, dense_dict: dict):
+    path = _fedhera_dense_global_path(output_dir, epoch)
+    torch.save({k: v.detach().cpu() for k, v in dense_dict.items()}, path)
+
 
 def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             client_budgets,
@@ -454,7 +467,9 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             lora_alpha=16,
             use_atw=False,
             atw_temperature=2.0, 
-            all_client_ids=None):
+            all_client_ids=None, 
+            server_agg: str = "original", 
+            prev_global_params=None):
     """
     Fed-Hera aggregation:
     1) Merge client adapters into W_global.
@@ -505,24 +520,89 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     weights_array = torch.nn.functional.normalize(weights_array, p=1, dim=0)
 
     # 1. Aggregation Phase
+    server_agg_mode = str(server_agg or "original").lower()
+    if server_agg_mode not in ["original", "unbiased"]:
+        raise ValueError(f"Unsupported FedHera server_agg mode: {server_agg_mode}")
+
+    prev_dense = None
+    if server_agg_mode == "unbiased":
+        if prev_global_params is not None:
+            prev_dense = prev_global_params
+        elif epoch > 0:
+            prev_dense = _load_fedhera_dense_global(output_dir, epoch - 1)
+            if prev_dense is None:
+                logging.warning(
+                    "[FedHera][epoch %d] Missing dense cache for epoch %d; fallback to original.",
+                    epoch, epoch - 1
+                )
+                server_agg_mode = "original"
+        else:
+            logging.info("[FedHera][epoch 0] unbiased requires prev dense cache; fallback to original.")
+            server_agg_mode = "original"
+
+    if server_agg_mode == "unbiased":
+        assert prev_dense is not None, "prev_dense must exist in unbiased mode"
+
+
     with torch.no_grad():
-        aggregated = {}
-        for k, client_id in tqdm(enumerate(selected_clients_set), desc="FedHera Aggregation"):
-            single_output = os.path.join(output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin")
-            state = torch.load(single_output, map_location="cpu")
-            for key in list(state.keys()):
-                if 'local' in key and 'bias' not in key and ('lora_A' in key):
-                    B_key = key.replace('lora_A', 'lora_B')
-                    rank = state[B_key].shape[1]
-                    merge_rate = 16 / max(rank, 1)
-                    base_key = '.'.join(key.split('.')[:-3]) + '.lora'
-                    merged = (state[B_key] @ state[key]) * merge_rate * weights_array[k]
-                    if base_key not in aggregated:
-                        aggregated[base_key] = merged.clone().to('cpu')
-                    else:
-                        aggregated[base_key] += merged.to('cpu')
-            del state
-            torch.cuda.empty_cache()
+        if server_agg_mode == "original":
+            aggregated = {}
+            for k, client_id in tqdm(enumerate(selected_clients_set)):
+                local_path = os.path.join(output_dir, str(client_id),
+                                        f"local_output_epoch_{epoch}", "pytorch_model.bin")
+                state = torch.load(local_path, map_location="cpu")
+
+                for key in list(state.keys()):
+                    if ('local' in key) and ('bias' not in key) and ('lora_A' in key):
+                        B_key = key.replace('lora_A', 'lora_B')
+                        rank = int(state[B_key].shape[1])
+                        merge_rate = float(lora_alpha) / float(max(rank, 1))  # 修正：别写死16
+                        base_key = '.'.join(key.split('.')[:-3]) + '.lora'
+                        merged = (state[B_key] @ state[key]) * merge_rate * weights_array[k]
+                        aggregated[base_key] = aggregated.get(base_key, 0) + merged.to("cpu")
+
+                del state
+                torch.cuda.empty_cache()
+
+        else:
+            # unbiased: W_{t+1} = W_t + Σ p_i (W_i^{t+1} - W_t^{r_i})
+            delta_sum = {}
+            for k, client_id in tqdm(enumerate(selected_clients_set)):
+                local_path = os.path.join(output_dir, str(client_id),
+                                        f"local_output_epoch_{epoch}", "pytorch_model.bin")
+                init_path = os.path.join(output_dir, str(client_id),
+                                        f"server_push_epoch_{epoch - 1}", "pytorch_model.bin")
+
+                local_state = torch.load(local_path, map_location="cpu")
+                init_state = torch.load(init_path, map_location="cpu") if os.path.exists(init_path) else {}
+
+                for key in list(local_state.keys()):
+                    if ('local' in key) and ('bias' not in key) and ('lora_A' in key):
+                        B_key = key.replace('lora_A', 'lora_B')
+                        rank = int(local_state[B_key].shape[1])
+                        merge_rate = float(lora_alpha) / float(max(rank, 1))
+                        base_key = '.'.join(key.split('.')[:-3]) + '.lora'
+                        merged_local = (local_state[B_key] @ local_state[key]) * merge_rate
+
+                        A_init_key = base_key + "_A.local.weight"
+                        B_init_key = base_key + "_B.local.weight"
+                        if (A_init_key in init_state) and (B_init_key in init_state):
+                            r_init = int(init_state[B_init_key].shape[1])
+                            merge_rate_init = float(lora_alpha) / float(max(r_init, 1))
+                            merged_init = (init_state[B_init_key] @ init_state[A_init_key]) * merge_rate_init
+                        else:
+                            merged_init = torch.zeros_like(merged_local)
+
+                        delta = (merged_local - merged_init) * weights_array[k]
+                        delta_sum[base_key] = delta_sum.get(base_key, 0) + delta.to("cpu")
+
+                del local_state, init_state
+                torch.cuda.empty_cache()
+
+            aggregated = {k: v.clone().to("cpu") for k, v in prev_dense.items()}
+            for base_key, d in delta_sum.items():
+                aggregated[base_key] = aggregated.get(base_key, 0) + d
+
 
     # 2. [ATW Logic] Compute s_i and update cache
     if use_atw:
@@ -793,7 +873,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
         round_transmit_bytes / MB,
         round_compute_bytes / MB,
     )
-
+    aggregated = {k: v.detach().cpu() for k, v in aggregated.items()}
+    _save_fedhera_dense_global(output_dir, epoch, aggregated)
     return aggregated
 
 

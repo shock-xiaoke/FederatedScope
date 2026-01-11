@@ -229,17 +229,18 @@ def load_weight_fedhera_if_exists(output_dir, client_id, epoch):
             key_B = layer_key + "_B.local.weight"
             
             if key_A in state and key_B in state:
-                # Scale Factor
-                # h = Wx + s * (Main + lambda * Tail)
-                # Tail_new = Tail_old * lambda
-                # 由于 A 和 B 是分解的，我们将 A_tail 和 B_tail 都乘以 sqrt(lambda)
+                tensor_A = state[key_A]
+                tensor_B = state[key_B]
+                
+                current_r_A = tensor_A.shape[0] # [r, d_in]
+                current_r_B = tensor_B.shape[1] # [d_out, r]
+                
+                if r_main >= current_r_A or r_main >= current_r_B:
+                    continue
+
                 scale = lambda_val ** 0.5
-                
-                # Process A: Shape [r, d_in], Tail is rows [r_main:]
-                state[key_A][r_main:, :] *= scale
-                
-                # Process B: Shape [d_out, r], Tail is cols [:, r_main:]
-                state[key_B][:, r_main:] *= scale
+                tensor_A[r_main:, :].mul_(scale)
+                tensor_B[:, r_main:].mul_(scale)
                 
         return state, meta
         
