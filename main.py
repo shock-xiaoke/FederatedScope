@@ -579,20 +579,18 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
         for key, spec in FL_training.layer_specs.items():
             d_out = int(spec.get("d_out", 0))
             d_in  = int(spec.get("d_in", 0))
-            dense_global_params[key] = torch.zeros((d_out, d_in), dtype=torch.float32)
-    
-    if args.aggregation == 'fedhl' and dense_global_params is None:
-        logging.info("[FedHL] Initializing dense global LoRA-update W0 as ZEROS (delta adapter).")
-        dense_global_params = {}
+            # 确保维度合法
+            if d_out > 0 and d_in > 0:
+                dense_global_params[key] = torch.zeros((d_out, d_in), dtype=torch.float32)
+            else:
+                logging.warning(f"Skipping initialization for invalid layer spec: {key} -> {spec}")
 
-        for key, spec in FL_training.layer_specs.items():
-            d_out = int(spec.get("d_out", 0))
-            d_in  = int(spec.get("d_in", 0))
-            assert d_out > 0 and d_in > 0, f"Bad layer spec for {key}: {spec}"
-            dense_global_params[key] = torch.zeros((d_out, d_in), dtype=torch.float32)
-
+    if args.aggregation == 'fedhl' and global_params is None:
         logging.info("[FedHL] Performing initial SVD distribution for Round 0.")
-        global_params = distribute_weight_fast(dense_global_params, config_local)
+        if dense_global_params is not None:
+            global_params = distribute_weight_fast(dense_global_params, config_local)
+        else:
+            raise ValueError("[FedHL] dense_global_params failed to initialize!")
 
     optim = 'sgd' if args.baseline == 'fedavg' else 'adamw_torch'
     fedhera_default_lora_state = None
