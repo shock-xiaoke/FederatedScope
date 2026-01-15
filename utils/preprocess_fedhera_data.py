@@ -77,6 +77,30 @@ def _to_fedhera_example_mathqa(example: Dict[str, Any]) -> Dict[str, Any]:
         "final_answer": extract_final_answer("MetaMathQA", answer),
     }
 
+def _to_fedhera_example_winogrande(example: Dict[str, Any]) -> Dict[str, Any]:
+    """Map WinoGrande examples to a binary choice style prompt (A/B)."""
+    sentence = example.get("sentence") or ""
+    opt1 = example.get("option1") or ""
+    opt2 = example.get("option2") or ""
+    
+    inp = f"Sentence: {sentence}\n(A) {opt1}\n(B) {opt2}"
+    
+    raw_answer = example.get("answer")
+    target_label = ""
+    
+    if str(raw_answer) == "1":
+        target_label = "A"
+    elif str(raw_answer) == "2":
+        target_label = "B"
+        
+    instruction = "Choose the correct option (A or B) to complete the sentence. Output only the letter."
+    
+    return {
+        "instruction": instruction,
+        "input": inp,
+        "output": target_label,
+        "category": "WinoGrande",
+    }
 
 def _to_fedhera_example_commonsense(example: Dict[str, Any]) -> Dict[str, Any]:
     """Map a commonsense QA-style record to (instruction, input, output)."""
@@ -392,6 +416,8 @@ def preprocess_task(
         mapper = _to_fedhera_example_hellaswag
     elif task == "alpaca":
         mapper = _to_fedhera_example_alpaca
+    elif task == "winogrande": 
+        mapper = _to_fedhera_example_winogrande
     else:
         raise ValueError(f"Unsupported task: {task}")
 
@@ -423,6 +449,7 @@ def parse_args() -> argparse.Namespace:
             "piqa",
             "hellaswag",
             "alpaca",
+            "winogrande",
         ],
         help="Which task to preprocess.",
     )
