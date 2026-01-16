@@ -256,26 +256,6 @@ def _to_fedhera_example_hellaswag(example: Dict[str, Any]) -> Dict[str, Any]:
     prompt_input = f"Context: {context}\nOptions:\n{options_text}\nAnswer:"
     return {"instruction": instruction, "input": prompt_input, "output": output, "category": "HellaSwag"}
 
-def _to_fedhera_example_winogrande(example: Dict[str, Any]) -> Dict[str, Any]:
-    """Map WinoGrande examples to a binary choice style prompt."""
-    sentence = example.get("sentence") or ""
-    opt1 = example.get("option1") or ""
-    opt2 = example.get("option2") or ""
-    inp = f"Sentence: {sentence}\nOption 1: {opt1}\nOption 2: {opt2}"
-    raw_answer = example.get("answer")
-    correct = ""
-    if str(raw_answer) == "1":
-        correct = opt1
-    elif str(raw_answer) == "2":
-        correct = opt2
-    instruction = "Choose the correct option to complete the sentence or resolve the ambiguity."
-    return {
-        "instruction": instruction,
-        "input": inp,
-        "output": correct,
-        "category": "WinoGrande",
-    }
-
 def _to_fedhera_example_alpaca(example: Dict[str, Any]) -> Dict[str, Any]:
     """Map Alpaca (Cleaned) examples to (instruction, input, output)."""
     # Alpaca already has 'instruction', 'input', and 'output' fields.
