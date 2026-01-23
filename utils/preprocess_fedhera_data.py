@@ -14,7 +14,6 @@ def _strip_boxed(s: str) -> str:
     if s is None:
         return ""
     s = s.strip()
-    # remove common latex wrappers
     s = s.replace("\\boxed", "")
     s = s.replace("{", "").replace("}", "")
     return s.strip()
@@ -23,21 +22,17 @@ def extract_final_answer(category: str, output: str) -> str:
     cat = (category or "").lower()
     out = output or ""
 
-    # GSM8K: prefer ####
     if cat == "gsm8k":
         m = re.findall(r"####\s*([^\n]+)", out)
         if m:
             return _strip_boxed(m[-1])
-        # fallback: last number
         m2 = _NUM_RE.findall(out)
         return _strip_boxed(m2[-1]) if m2 else ""
 
-    # MetaMathQA / Arithmetic / SVAMP: last number-like token, also handle boxed fractions
     m2 = _NUM_RE.findall(out)
     if m2:
         return _strip_boxed(m2[-1])
 
-    # fallback: try 'answer is'
     m3 = re.findall(r"answer\s+is\s*[:：]?\s*([^\n]+)", out, flags=re.IGNORECASE)
     if m3:
         return _strip_boxed(m3[-1])
@@ -117,7 +112,6 @@ def _to_fedhera_example_commonsense(example: Dict[str, Any]) -> Dict[str, Any]:
         or example.get("input")
         or ""
     )
-    # Label / answer field names vary widely across commonsense datasets.
     answer = (
         example.get("answer")
         or example.get("label")
@@ -150,7 +144,6 @@ def _to_fedhera_example_e2e(example: Dict[str, Any]) -> Dict[str, Any]:
         or example.get("input")
         or ""
     )
-    # Different variants store references under different keys.
     ref = (
         example.get("human_reference")
         or example.get("reference")
@@ -258,16 +251,11 @@ def _to_fedhera_example_hellaswag(example: Dict[str, Any]) -> Dict[str, Any]:
 
 def _to_fedhera_example_alpaca(example: Dict[str, Any]) -> Dict[str, Any]:
     """Map Alpaca (Cleaned) examples to (instruction, input, output)."""
-    # Alpaca already has 'instruction', 'input', and 'output' fields.
-    # We just need to handle cases where input is empty or combine them if needed.
     
     instruction = example.get("instruction") or ""
     inp = example.get("input") or ""
     output = example.get("output") or ""
     
-    # Alpaca prompts usually don't need 'input' if it's empty, 
-    # but FedHera format often expects separate fields.
-    # We will keep them as is, consistent with standard Alpaca formatting.
     
     return {
         "instruction": instruction,
@@ -344,7 +332,6 @@ def _load_source_dataset(task: str, hf_dataset: str | None, data_files: str | No
     or from local JSON/JSONL/CSV files (data_files).
     """
     if hf_dataset:
-        # Some datasets (e.g., openai/gsm8k) require an explicit config ("main"/"socratic").
         load_kwargs = {"split": split}
         if hf_config and str(hf_config).lower() != "none":
             ds = load_dataset(hf_dataset, name=hf_config, **load_kwargs)
@@ -353,7 +340,6 @@ def _load_source_dataset(task: str, hf_dataset: str | None, data_files: str | No
     else:
         if data_files is None:
             raise ValueError("Either --hf_dataset or --data_files must be provided.")
-        # Let datasets infer the format from extension.
         if data_files.endswith(".csv"):
             ds = load_dataset("csv", data_files=data_files, split="train")
         else:
@@ -403,7 +389,6 @@ def preprocess_task(
 
     for ex in ds:
         rec = mapper(ex)
-        # Ensure we have valid instruction/output for training
         if rec["instruction"] and rec["output"]:
             records.append(rec)
 

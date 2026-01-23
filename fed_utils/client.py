@@ -24,29 +24,23 @@ def make_training_arguments(**kwargs):
     sig = inspect.signature(transformers.TrainingArguments.__init__)
     allowed = set(sig.parameters.keys())
 
-    # rename mapping for different transformers versions
     rename_map = {
-        "evaluation_strategy": "eval_strategy",   # some versions rename/deprecate
-        "save_strategy": "save_strategy",         # keep, but here for symmetry
+        "evaluation_strategy": "eval_strategy", 
+        "save_strategy": "save_strategy",        
         "logging_strategy": "logging_strategy",
     }
 
     fixed = dict(kwargs)
 
-    # rename if needed
     for old, new in rename_map.items():
         if old in fixed and old not in allowed and new in allowed:
             fixed[new] = fixed.pop(old)
 
-    # filter unsupported
     filtered = {k: v for k, v in fixed.items() if k in allowed}
 
     return transformers.TrainingArguments(**filtered)
 
 
-# -----------------------------
-# Helpers: parsing & normalization
-# -----------------------------
 _LABEL_RE = re.compile(r"\b(A|B|C|D|TRUE|FALSE)\b", re.IGNORECASE)
 
 
@@ -72,12 +66,10 @@ def _normalize_math_token(x: str) -> str:
     x = _norm_space(x)
     if not x:
         return ""
-    # Remove surrounding latex wrappers if any
     x = x.replace("\\boxed", "").replace("{", "").replace("}", "")
     x = x.replace("\\,", "").replace(",", "")
     x = x.strip()
 
-    # Try fraction a/b
     if "/" in x:
         parts = x.split("/")
         if len(parts) == 2:
@@ -87,20 +79,16 @@ def _normalize_math_token(x: str) -> str:
             except Exception:
                 pass
 
-    # Try int
     try:
         iv = int(x)
         return str(iv)
     except Exception:
         pass
 
-    # Try float (keep minimal string)
     try:
         fv = float(x)
-        # Avoid scientific notation issues
         if abs(fv - round(fv)) < 1e-9:
             return str(int(round(fv)))
-        # Trim trailing zeros
         s = f"{fv:.10f}".rstrip("0").rstrip(".")
         return s
     except Exception:
@@ -132,9 +120,6 @@ def exact_match(a: str, b: str) -> float:
     return 1.0 if _norm_space(a) == _norm_space(b) else 0.0
 
 
-# -----------------------------
-# Client
-# -----------------------------
 class GeneralClient:
     def __init__(
         self,
@@ -150,7 +135,6 @@ class GeneralClient:
         hetero_lora=False,
         optim='adamw_torch',
         dataloader_num_workers=4,
-        # NEW eval knobs
         eval_protocol: str = "auto",          # auto|gen|legacy_tf
         eval_answer_only_loss: bool = True,   # mask prompt for eval/test loss
         eval_max_samples: int = 0,            # 0 means all
@@ -179,14 +163,12 @@ class GeneralClient:
         self.dataloader_num_workers = dataloader_num_workers
         self.pin_memory = torch.cuda.is_available()
 
-        # eval knobs
         self.eval_protocol = (eval_protocol or "auto").lower()
         self.eval_answer_only_loss = bool(eval_answer_only_loss)
         self.eval_max_samples = int(eval_max_samples or 0)
         self.eval_gen_batch_size = int(eval_gen_batch_size or 1)
         self.eval_gen_max_new_tokens = int(eval_gen_max_new_tokens or 128)
 
-    # ---- tokenization (with optional prompt masking) ----
     def generate_and_tokenize_prompt(self, data_point, mask_inputs: Optional[bool] = None):
         """
         mask_inputs:
@@ -220,10 +202,8 @@ class GeneralClient:
         return tokenized_full_prompt
 
     def preprare_local_dataset(self, local_val_set_size=0):
-        # Train: follow train_on_inputs
         train_map_fn = lambda x: self.generate_and_tokenize_prompt(x, mask_inputs=None)
 
-        # Eval/Test: optionally force answer-only loss (community-friendly)
         eval_mask = True if self.eval_answer_only_loss else None
         eval_map_fn = lambda x: self.generate_and_tokenize_prompt(x, mask_inputs=eval_mask)
 
@@ -240,7 +220,6 @@ class GeneralClient:
 
         self.local_val_set_size = len(self.local_eval_dataset)
 
-    # ---- local trainer (training-time metrics can stay token-acc; we will use gen-metrics in test()) ----
     def build_local_trainer(
         self,
         tokenizer,
@@ -254,7 +233,6 @@ class GeneralClient:
         reg=None,
     ):
         def compute_metrics(pred):
-            # Keep a lightweight token-level metric during training (optional).
             logits = pred.predictions
             if isinstance(logits, tuple):
                 logits = logits[0]
@@ -348,12 +326,7 @@ class GeneralClient:
         logging.info(result.metrics)
         return self.local_trainer.state.log_history[-2]
 
-    # -----------------------------
-    # Generation-based evaluation (community metrics)
-    # -----------------------------
     def _infer_dataset_tag(self) -> str:
-        # data_path/.../local_eval_{id}.json -> infer tag from parent dirs is hard here.
-        # Instead rely on category field if exists; otherwise fallback to empty.
         try:
             ex0 = self.eval_data["train"][0]
             return str(ex0.get("category", "")).lower()
@@ -430,7 +403,6 @@ class GeneralClient:
         hint = (dataset_tag or "").lower() or self._infer_dataset_tag()
         task_type = self._get_task_type(hint)
 
-        # per-task decode length
         if task_type == "mc":
             max_new = 4
         elif task_type == "math":
@@ -442,7 +414,6 @@ class GeneralClient:
 
         preds = self._generate_batch(prompts, max_new_tokens=max_new)
 
-        # ---- metrics ----
         if task_type == "mc":
             correct = 0
             total = max(1, len(items))
@@ -460,7 +431,6 @@ class GeneralClient:
             for ptxt, ex in zip(preds, items):
                 cat = str(ex.get("category", "")).lower()
                 gold_text = str(ex.get("output", ""))
-                # Prefer a precomputed final_answer field if you add it later
                 gold_final = str(ex.get("final_answer", "")).strip()
                 if gold_final:
                     gold_final = _normalize_math_token(gold_final)
@@ -483,7 +453,6 @@ class GeneralClient:
             pred_str = [_norm_space(x) for x in preds]
             ref_str = [_norm_space(str(ex.get("output", ""))) for ex in items]
 
-            # Use local rouge metric path as in your repo
             rouge = evaluate.load('./evaluate/metrics/rouge/rouge.py')
             rouge_out = rouge.compute(predictions=pred_str, references=ref_str, use_aggregator=True)
             out = {
@@ -494,12 +463,8 @@ class GeneralClient:
             }
             return out
 
-        # fallback: return nothing
         return {}
 
-    # -----------------------------
-    # test(): eval_loss + generation-based metrics
-    # -----------------------------
     def test(self, epoch, local_micro_batch_size, dataset_tag: Optional[str] = None):
         use_cuda = torch.cuda.is_available()
         major, _ = torch.cuda.get_device_capability(0) if use_cuda else (0, 0)

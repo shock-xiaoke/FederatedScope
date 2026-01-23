@@ -52,11 +52,8 @@ def load_weight_local(weighted_single_weights, model):
 
 
 def distribute_weight(weighted_single_weights, model):
-    # mode is local model
-    # around 15 min for one client
     weight_dict = {}
     for key in tqdm(weighted_single_weights.keys()):
-        # _, target, target_name = peft.utils.other._get_submodules(model, key + '_A.local')
         rank = 2048
         merge_rate = 16 / rank
         W_cpu = (weighted_single_weights[key] / merge_rate).detach().to('cpu')
@@ -68,8 +65,6 @@ def distribute_weight(weighted_single_weights, model):
         lora_A = v
         weight_dict[key + '_A.local.weight'] = lora_A
         weight_dict[key + '_B.local.weight'] = lora_B
-        # print(key + '_A.local.weight', lora_A.shape)
-        # print(key + '_B.local.weight', lora_B.shape)
     return weight_dict
 
 def distribute_weight_fast(weighted_single_weights, config_local):
@@ -98,7 +93,6 @@ def distribute_weight_fast(weighted_single_weights, config_local):
                 V = vT[:rank, :]
                 lora_B = U @ torch.diag(S)
                 lora_A = V
-                # merge_rate = 2
                 merge_rate = alpha/rank
                 weight_dict[key + '_A.local.weight.' + str(rank)] = lora_A
                 weight_dict[key + '_B.local.weight.' + str(rank)] = lora_B/ merge_rate
@@ -118,7 +112,6 @@ def modify_adapter(peft_model, adapter_name, modify_module_rank=None, layer_dict
         layer_dict = []
 
     for name, module in peft_model.named_modules():
-        # If layer_dict is empty, match all layers; otherwise restrict to the given list.
         if layer_dict and not any(f".{layer}." in name for layer in layer_dict):
             continue
         for key, r in modify_module_rank.items():
@@ -128,10 +121,8 @@ def modify_adapter(peft_model, adapter_name, modify_module_rank=None, layer_dict
                 alpha = lora_alpha
             
             if key in name and (isinstance(module, peft.tuners.lora.Linear) or isinstance(module, peft.tuners.lora.Linear8bitLt)):
-                # Try PEFT new signature (requires use_rslora); fallback to old signature.
                 use_rslora = False
                 try:
-                    # If available, read from peft config
                     if hasattr(peft_model, "peft_config") and adapter_name in peft_model.peft_config:
                         use_rslora = bool(getattr(peft_model.peft_config[adapter_name], "use_rslora", False))
                 except Exception:
@@ -143,32 +134,22 @@ def modify_adapter(peft_model, adapter_name, modify_module_rank=None, layer_dict
                     module.update_layer(adapter_name, r, alpha, lora_dropout, init_lora_weights)
 
 
-
-# fed_utils/adaptive_peft.py (append)
 import json
 import torch.nn as nn
 
 def apply_lora_prefix_mask(peft_model, per_layer_r_main):
-    """
-    peft_model: PEFT LoRA 模型
-    per_layer_r_main: Dict[layer_key] -> int
-    对 A/B 注册梯度hook：只让前 r_main 列/行产生梯度。
-    """
     hooks = []
     for name, param in peft_model.named_parameters():
         if "lora_A" in name or "lora_B" in name:
-            # name 示例: model.layers.0.self_attn.q_proj.lora_A.local.weight
             base_key = '.'.join(name.split('.')[:-3]) + '.lora'
             r_main = int(per_layer_r_main.get(base_key, 0))
             if r_main <= 0:
                 mask = torch.zeros_like(param, dtype=param.dtype, device=param.device)
             else:
                 if "lora_A" in name:
-                    # A: [r, d_in] -> 只保留前 r_main 行
                     mask = torch.zeros_like(param)
                     mask[:r_main, :] = 1
                 else:
-                    # B: [d_out, r] -> 只保留前 r_main 列
                     mask = torch.zeros_like(param)
                     mask[:, :r_main] = 1
 
@@ -181,13 +162,8 @@ def apply_lora_prefix_mask(peft_model, per_layer_r_main):
             hooks.append(param.register_hook(_make_hook(mask)))
     return hooks
 
-# [修改] fed_utils/adaptive_peft.py
 
 def load_weight_fedhera_if_exists(output_dir, client_id, epoch):
-    """
-    若存在 server_push 包，读取并返回 (state_dict, meta)；否则返回 (None, None)
-    新增逻辑：如果 meta 中包含 lambda 且 lambda < 1，则对 Frozen Tail 进行缩放。
-    """
     import os, json, torch
     push_dir = os.path.join(output_dir, str(client_id), f"server_push_epoch_{epoch}")
     model_path = os.path.join(push_dir, "pytorch_model.bin")
@@ -197,16 +173,6 @@ def load_weight_fedhera_if_exists(output_dir, client_id, epoch):
         state = torch.load(model_path, map_location="cpu")
         with open(meta_path, "r") as f:
             meta = json.load(f)
-        # [新增] 应用 ATW Lambda Scaling
-        # 我们需要在加载前修改 state 中的权重
-        # 逻辑：对于每一层，获取 r_main 和 lambda。
-        # A: [r_tot, d_in] -> Tail 是 row[r_main:]
-        # B: [d_out, r_tot] -> Tail 是 col[:, r_main:]
-        # 将 Tail 部分乘以 sqrt(lambda) (因为 W = B@A，两边各乘 sqrt(lambda) 等于整体乘 lambda)
-        # 或者只乘一边。为了对称，通常各乘 sqrt(lambda)。
-        
-        # 检查是否所有层的 lambda 都一样（目前的实现是 client 级 lambda）
-        # 直接遍历 meta 即可
         
         for layer_key, info in meta.items():
             if info.get("skip", False):

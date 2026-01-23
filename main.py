@@ -51,8 +51,8 @@ def calculate_dynamic_budgets(layer_specs, num_clients, hetero_mode, seed=42):
             continue
         unit_params += (d_in + d_out)
 
-    unit_comm_cost_bytes = unit_params * 2.0  # BF16/FP16 bytes per param
-    unit_comp_cost_ms = unit_params * 1.7e-04  # matched to model_aggregation.py
+    unit_comm_cost_bytes = unit_params * 2.0 
+    unit_comp_cost_ms = unit_params * 1.7e-04 
     safety = 1.1
 
     targets = {
@@ -116,7 +116,7 @@ def extract_lora_layer_specs(model, target_modules):
         else:
             d_out, d_in = int(weight.shape[0]), int(weight.shape[1])
             
-        base_key = f"base_model.model.{name}.lora"  # Mirror PEFT naming consumed downstream.
+        base_key = f"base_model.model.{name}.lora" 
         layer_specs[base_key] = {"d_out": d_out, "d_in": d_in}
     return layer_specs
 
@@ -159,8 +159,8 @@ def calculate_active_layers_from_budget(client_budgets, layer_specs, lora_rank):
         params_per_layer.append((d_in + d_out) * lora_rank)
 
     avg_params_per_layer = float(np.mean(params_per_layer)) if params_per_layer else 0.0
-    comm_cost_per_layer = avg_params_per_layer * 2.0  # BF16 bytes per param
-    comp_cost_per_layer = avg_params_per_layer * 1.7e-04  # ms per layer scaled by params
+    comm_cost_per_layer = avg_params_per_layer * 2.0 
+    comp_cost_per_layer = avg_params_per_layer * 1.7e-04  
     MB = 1024 * 1024
 
     num_active_layers = {}
@@ -305,47 +305,35 @@ def read_options():
     return args
 
 
-# [修改] main.py 中的 model_and_tokenizer 函数
-
 def model_and_tokenizer(global_model, device_map='cuda'):
-    # 处理 device_map 参数
     map_arg = device_map
     if isinstance(device_map, str) and device_map.lower() in ["cuda", "gpu", "single", "0"]:
         map_arg = {"": 0}
 
-    # 1. 加载模型：增加 attn_implementation="flash_attention_2"
-    # Llama-3.2 强烈建议使用 bfloat16 和 Flash Attention 2
     model = AutoModelForCausalLM.from_pretrained(
         global_model,
         device_map=map_arg,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",  # [新增] 适配 Llama-3.2
+        attn_implementation="flash_attention_2", 
     )
     
-    # 启用梯度检查点时的参数更新
-    # use_reentrant=False 是新版推荐设置，避免警告和潜在显存问题
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.config.use_cache = False
     model.enable_input_require_grads()
 
-    # 2. 加载 Tokenizer
-    # Llama-3 的 tokenizer 不需要 use_fast=False 强制降级，新版 fast tokenizer 已经很稳定
     tokenizer = AutoTokenizer.from_pretrained(
         global_model,
         trust_remote_code=True,
-        use_fast=True, # [建议] 改为 True，除非显存非常紧张
-        padding_side="left" # Decoder-only 模型通常左填充
+        use_fast=True, 
+        padding_side="left" 
     )
     
-    # 3. 修复 Pad Token (关键)
-    # Llama-3.2 的 tokenizer 通常没有默认 pad_token_id，或者 pad_token_id 是一个特殊保留位
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token_id is not None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
             print(f"Warning: pad_token_id was None, set to eos_token_id: {tokenizer.eos_token_id}")
         else:
-            # 万一连 EOS 都没有（极少见），设为 0
             tokenizer.pad_token_id = 0
             
     return model, tokenizer
@@ -358,12 +346,10 @@ def resolve_lora_targets_and_config_types(model, user_target_modules=None):
     """
     model_type = getattr(model.config, "model_type", "").lower()
 
-    # If the user explicitly provided a list, always respect it verbatim.
     if user_target_modules:
         target_modules = user_target_modules
     else:
         if model_type in ["llama", "mistral", "gemma"]:
-            # LLaMA/Mistral/Gemma use the same projection names.
             target_modules = [
                 "q_proj",
                 "k_proj",
@@ -374,16 +360,11 @@ def resolve_lora_targets_and_config_types(model, user_target_modules=None):
                 "down_proj",
             ]
         elif model_type in ["gpt2"]:
-            # GPT-2 blocks: attn.c_attn / attn.c_proj / mlp.c_fc / mlp.c_proj
             target_modules = ["c_attn", "c_proj", "c_fc"]
         else:
-            # Fallback to the original default.
             target_modules = ['q_proj', 'v_proj']
 
     # Heterogeneous PEFT type presets.
-    # Tie the three tiers directly to the canonical
-    # resource levels so that FlexLoRA always picks
-    # ranks from {4, 8, 16}.
     small_r = RESOURCE_RANKS["low"]
     medium_r = RESOURCE_RANKS["medium"]
     large_r = RESOURCE_RANKS["high"]
@@ -410,7 +391,6 @@ def resolve_lora_targets_and_config_types(model, user_target_modules=None):
             },
         }
     else:
-        # Generic patterns for other architectures (including GPT-2).
         config_types = {
             'Type_0': {m: small_r for m in target_modules},
             'Type_1': {m: large_r for m in target_modules},
@@ -426,9 +406,9 @@ def _resource_probabilities(mode: str):
     Map hetero mode to (low, medium, high) probabilities for FlexLoRA-style rank sampling.
     """
     if mode == 'setting_A':
-        return [1/3, 1/3, 1/3]  # uniform
+        return [1/3, 1/3, 1/3] 
     if mode == 'setting_B':
-        return [0.3, 0.5, 0.2]  # 30% low, 50% mid, 20% high
+        return [0.3, 0.5, 0.2] 
     return [1/3, 1/3, 1/3]
 
 
@@ -517,7 +497,6 @@ def resume(args, data_path, output_dir, config_local):
         )
         global_params = distribute_weight_fast(global_params, config_local)
     elif args.aggregation == 'flora':
-            # 1. Aggregate via Stacking (FLoRA specific)
             global_params = FLoRA(selected_clients_set,
                                   output_dir,
                                   local_dataset_len_dict,
@@ -528,7 +507,6 @@ def resume(args, data_path, output_dir, config_local):
             if args.save_model:
                 torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
                 
-            # 2. Distribute via SVD (Reuse FlexLoRA's distribution logic)
             global_params = distribute_weight_fast(global_params, config_local)
     else:
         global_params = None
@@ -595,8 +573,6 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
     optim = 'sgd' if args.baseline == 'fedavg' else 'adamw_torch'
     fedhera_default_lora_state = None
     if args.aggregation == 'fedhera':
-        # Snapshot initial LoRA weights as a global default for cases where no server push exists yet
-        # (e.g., epoch 0 or resumed runs with missing push folders).
         fedhera_default_lora_state = {
             k: v.detach().cpu().clone()
             for k, v in model.state_dict().items()
@@ -647,7 +623,6 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             hera_hooks = None
             if args.aggregation == 'fedhera':
                 from fed_utils.adaptive_peft import load_weight_fedhera_if_exists, apply_lora_prefix_mask, modify_adapter
-                # Find the latest available server push for this client
                 pkg, meta = None, None
                 for e in range(epoch - 1, -1, -1):
                     pkg_tmp, meta_tmp = load_weight_fedhera_if_exists(output_dir, client_id, e)
@@ -656,7 +631,6 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                         break
 
                 if pkg is not None and meta is not None:
-                    # 有 Push：加载 Push
                     per_layer_r_tot = {}
                     for base_key, info in meta.items():
                         if info.get("skip", False): continue
@@ -675,13 +649,10 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                     per_layer_r_main = {k: int(v.get("r_main", 0)) for k, v in meta.items() if not v.get("skip", False)}
                     hera_hooks = apply_lora_prefix_mask(model, per_layer_r_main)
                 else:
-                    # 无 Push：重置为默认 (修复了这里的 NoneType 错误)
-                    # 使用 config.target_modules 作为更可靠的来源
                     base_rank = int(getattr(args, 'lora_r', 8))
                     
-                    # [修复] 优先使用 config 中的 target_modules，因为 args.lora_target_modules 可能是 None
                     targets = config.target_modules if config and hasattr(config, "target_modules") else (args.lora_target_modules or [])
-                    if isinstance(targets, str): targets = [targets] # 防止是字符串
+                    if isinstance(targets, str): targets = [targets]
                     
                     base_rank_map = {m: base_rank for m in targets}
                     
@@ -726,11 +697,9 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             local_eval_result = client.test(epoch, args.local_micro_batch_size, dataset_tag=dataset_tag)
             n_i = local_dataset_len_dict[client_id]
 
-            # always have loss (from HF evaluate)
             if 'eval_loss' in local_eval_result:
                 local_eval_results += float(local_eval_result['eval_loss']) * n_i
 
-            # generation metrics by task
             if 'eval_accuracy' in local_eval_result:
                 local_eval_acc = locals().get('local_eval_acc', 0.0) + float(local_eval_result['eval_accuracy']) * n_i
                 locals()['local_eval_acc'] = local_eval_acc
@@ -769,7 +738,6 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                             lora_alpha=args.lora_alpha
                         )
                         logging.info(f"[DriftMetrics] Epoch {epoch}, Algorithm {args.aggregation}, Drift {drift_val}")
-                        # 你可以将这个值存到 list 里最后画图
                     except RuntimeError as e:
                         logging.error(f"OOM during Oracle training: {e}")
                         torch.cuda.empty_cache()
@@ -819,12 +787,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             if args.fedhera_server_agg == 'unbiased':
                 if new_global_params is not None:
                     dense_global_params = new_global_params
-                    # 可选：如果需要计算 Drift，这里可以将 dense 转回 SVD 形式赋给 global_params
-                    # global_params = distribute_weight_fast(dense_global_params, config_local) 
                 else:
                     logging.warning("FedHera returned None in unbiased mode! Check fed_utils implementation.")
-            # adapter_model.bin 可存聚合Wg，便于可视化/对照
-            # torch.save(_, os.path.join(output_dir, "adapter_model.bin"))
         elif args.aggregation == 'fedhello':
             global_params = FedHeLLo(
                 selected_clients_set,
@@ -858,7 +822,6 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                                   )
             if args.save_model:
                 torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
-            # FLoRA in this codebase aggregates to dense weights, so we must redistribute via SVD
             global_params = distribute_weight_fast(global_params, config_local)
         elif args.aggregation == 'fedhl':
             
@@ -891,7 +854,6 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             else:
                 current_count += 1
             if current_count > patience:
-                # Example logging at end of round
                 global_eval_loss = local_eval_results / max(1, total_data_num)
                 logging.info(f"[Round {epoch}] global_eval_loss={global_eval_loss:.6f}")
 
@@ -907,7 +869,6 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                     global_eval_rouge_L = local_eval_rouge_L / max(1, total_data_num)
                     logging.info(f"[Round {epoch}] global_eval_rougeL={global_eval_rouge_L:.4f}")
 
-                # Log final communication / compute statistics before exiting.
                 try:
                     stats = get_traffic_stats()
                     logging.info("[TrafficSummary] %s", stats)
@@ -918,7 +879,6 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
         import gc
         gc.collect()
 
-    # Training finished without early stopping: record final traffic stats.
     try:
         stats = get_traffic_stats()
         logging.info("[TrafficSummary] %s", stats)
@@ -958,13 +918,11 @@ def main():
 
     prompter = Prompter(args.prompt_template_name)
 
-    # Choose model-appropriate LoRA target modules and heterogeneity configs.
     lora_target_modules, config_types = resolve_lora_targets_and_config_types(
         model,
         user_target_modules=args.lora_target_modules,
     )
 
-    # Build layer specs and budgets once for all aggregation strategies.
     layer_specs = extract_lora_layer_specs(model, lora_target_modules)
     client_budgets = calculate_dynamic_budgets(layer_specs, args.num_clients, args.hetero_mode, seed=args.seed)
     calculated_ranks = calculate_unified_rank_from_budget(client_budgets, layer_specs)
@@ -1026,11 +984,6 @@ def main():
     if args.baseline != 'slora':
         model = get_peft_model(model, config, adapter_name = 'local')
     
-    # world_size = int(os.environ.get("WORLD_SIZE", 1))
-    # ddp = world_size != 1
-    # if not ddp and torch.cuda.device_count() > 1:
-    #     model.is_parallelizable = True
-    #     model.model_parallel = True
 
     FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_local=config_local, config=config, config_types=config_types)
 

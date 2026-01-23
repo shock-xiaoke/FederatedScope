@@ -9,15 +9,12 @@ import logging
 from tqdm import tqdm
 
 
-# Simple global traffic counters to let the training loop
-# summarise total communication and compute volume.
 TRAFFIC_STATS = {
     "FlexLoRA": {"transmit_MB": 0.0, "compute_MB": 0.0},
     "FedHera": {"transmit_MB": 0.0, "compute_MB": 0.0},
     "FedHeLLo": {"transmit_MB": 0.0, "compute_MB": 0.0},
     "FLoRA": {"transmit_MB": 0.0, "compute_MB": 0.0},
 }
-# [NEW] Global cache for ATW stats: {client_id: {"s": float, "t": int}}
 FEDHERA_CLIENT_STATS = {}
 
 
@@ -28,7 +25,6 @@ def reset_traffic_stats():
 
 
 def get_traffic_stats():
-    # Return a shallow copy so callers cannot mutate internals.
     return {
         name: stats.copy()
         for name, stats in TRAFFIC_STATS.items()
@@ -46,14 +42,11 @@ def FLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch, clien
     4. Compute B_stack @ A_stack to get the global dense update.
     5. Return the dense update so 'distribute_weight_fast' can redistribute it via SVD.
     """
-    # Calculate p_k (weights_array)
     weights_array = torch.tensor(
         [local_dataset_len_dict[client_id] for client_id in selected_clients_set], dtype=torch.float32
     )
     weights_array = torch.nn.functional.normalize(weights_array, p=1, dim=0)
     
-    # Storage for stacking
-    # Structure: { 'module_name': { 'A': [list_of_tensors], 'B': [list_of_tensors] } }
     stacking_buffer = {}
     
     round_transmit_bytes = 0.0
@@ -72,11 +65,9 @@ def FLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch, clien
             comp_time_ms = 0.0
             
             for key in list(single_weights.keys()):
-                # Identify valid LoRA A keys
                 if 'local' in key and 'bias' not in key and 'lora_A' in key:
                     B_key = key.replace('lora_A', 'lora_B')
                     
-                    # Base module name (e.g., base_model.model.model.layers.0.self_attn.q_proj.lora)
                     base_key = '.'.join(key.split('.')[:-3]) + '.lora'
                     
                     if base_key not in stacking_buffer:
@@ -86,22 +77,13 @@ def FLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch, clien
                     B_w = single_weights[B_key]
                     rank = A_w.shape[0] # LoRA A is [r, d_in]
                     
-                    # Apply Scaling Factor p_k to A only (Eq 11 in FLoRA paper)
-                    # Note: We also handle the scaling factor `merge_rate` (alpha/r) here if needed, 
-                    # but typically merge_rate is baked into forward. 
-                    # For consistency with FlexLoRA code in this repo, we apply merge_rate sqrt adjustment or standard logic.
-                    # FlexLoRA code does: (B @ A) * merge_rate * weight.
-                    # To achieve equivalence via stacking: A_new = A * weight * merge_rate, B_new = B.
-                    # Or split merge_rate between them. Let's follow the standard:
                     merge_rate = 16 / max(rank, 1)
                     
-                    # We apply the full scalar weight to A for simplicity of stacking
                     A_weighted = A_w * weights_array[k] * merge_rate
                     
                     stacking_buffer[base_key]['A'].append(A_weighted)
                     stacking_buffer[base_key]['B'].append(B_w)
 
-                    # --- Traffic Stats Tracking ---
                     d_in = A_w.shape[1]
                     d_out = B_w.shape[0]
                     elem_bytes = A_w.element_size()
@@ -110,7 +92,6 @@ def FLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch, clien
                     round_compute_bytes += bytes_this
                     
                     if client_budgets is not None:
-                        # Client-side utility tracking
                         if layer_specs is not None and base_key in layer_specs:
                             spec = layer_specs[base_key]
                             d_out_spec = int(spec.get("d_out", d_out))
@@ -139,20 +120,15 @@ def FLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch, clien
             del single_weights
             torch.cuda.empty_cache()
 
-    # Perform Stacking and Multiplication
     weighted_single_weights = {}
     for base_key, matrices in stacking_buffer.items():
         if not matrices['A']: 
             continue
             
-        # Stack A vertically (dim 0 for [r, d_in]) -> Result [Total_R, d_in]
         A_stack = torch.cat(matrices['A'], dim=0)
         
-        # Stack B horizontally (dim 1 for [d_out, r]) -> Result [d_out, Total_R]
         B_stack = torch.cat(matrices['B'], dim=1)
         
-        # Compute global dense weight W = B_stack @ A_stack
-        # This effectively sums B_k @ (A_k * p_k)
         merged_weight = B_stack @ A_stack
         
         weighted_single_weights[base_key] = merged_weight
@@ -180,12 +156,6 @@ def FedAvg(selected_clients_set, output_dir, local_dataset_len_dict, epoch, clie
         single_output_dir = os.path.join(output_dir, str(client_id), "local_output_epoch_{}".format(epoch),
                                          "pytorch_model.bin")
         single_weights = torch.load(single_output_dir, map_location='cpu')
-        # delete_lst = []
-        # for key in single_weights.keys():
-        #     if 'bias' in key and 'lora_B' in key:
-        #         delete_lst.append(key)
-        # for key in delete_lst:
-        #     del single_weights[key]
         with torch.no_grad():
             if k == 0:
                 weighted_single_weights = {key: 0 for key in
@@ -232,34 +202,25 @@ def FedAvg(selected_clients_set, output_dir, local_dataset_len_dict, epoch, clie
         gc.collect()
         torch.cuda.empty_cache()
 
-    # set_peft_model_state_dict(model, weighted_single_weights, "default")
     torch.cuda.empty_cache()
     return weighted_single_weights
 
 def FedHeLLo(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
              active_layers_map=None, prev_global_params=None, layer_specs=None):
-    """
-    Fed-HeLLo 聚合（最小侵入版）：
-    - client 侧已经通过 active_lora_layers 冻结了未分配的 LoRA 层，只保存训练过的 LoRA 参数。
-    - 这里对所有上传的 LoRA 参数做“按样本数加权的 FedAvg”。
-    - 某个参数 key 只在存在该 key 的客户端上做加权平均（其它客户端不参与该 key 的聚合）。
-    """
     import os
     from torch.nn.functional import normalize
 
-    # 本函数不再使用 active_layers_map / layer_specs，保留参数仅为兼容现有调用接口
     del active_layers_map
     total_layers = len(layer_specs or {})
 
-    # 按本地样本数计算 client 级权重
     lens = [local_dataset_len_dict[client_id] for client_id in selected_clients_set]
     weights_array = normalize(
         torch.tensor(lens, dtype=torch.float32),
         p=1, dim=0
     )
 
-    accum = {}         # key -> 加权和
-    weight_sums = {}   # key -> 对应该 key 的权重之和（仅来自有该 key 的客户端）
+    accum = {}       
+    weight_sums = {}   
     round_transmit_bytes = 0.0
     MB = 1024.0 * 1024.0
 
@@ -289,7 +250,6 @@ def FedHeLLo(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             del state
             torch.cuda.empty_cache()
 
-    # 先把上一轮的全局参数拷贝过来（主要是为了保留未出现 key 的旧值）
     aggregated = {}
     if prev_global_params is not None:
         aggregated.update({
@@ -297,13 +257,11 @@ def FedHeLLo(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             for k, v in prev_global_params.items()
         })
 
-    # 对每个出现过的 key，根据该 key 的权重和做加权平均
     for key, summed in accum.items():
         wsum = weight_sums.get(key, 0.0)
         if wsum > 0.0:
             aggregated[key] = summed / wsum
         else:
-            # 理论上不会出现 wsum=0，如果出现就直接当作简单相加结果
             aggregated[key] = summed
 
     TRAFFIC_STATS["FedHeLLo"]["transmit_MB"] += round_transmit_bytes / MB
@@ -336,7 +294,6 @@ def truncate(selected_clients_set, output_dir, local_dataset_len_dict, epoch, ha
                             merge_rate = 16 / rank
                         else:
                             merge_rate = 1
-                        # new_key = '.'.join(key.split('.')[:-3]) + '.lora'
                         if key not in weighted_single_weights.keys():
                             weighted_single_weights[key] = torch.zeros(360, int(single_weights[key].shape[1])).to('cpu')
                             weighted_single_weights[B_key] = torch.zeros(int(single_weights[B_key].shape[0]), 360).to('cpu')
@@ -344,7 +301,6 @@ def truncate(selected_clients_set, output_dir, local_dataset_len_dict, epoch, ha
                         weighted_single_weights[B_key][:, :rank] += single_weights[B_key] * weights_array[k] * np.sqrt(merge_rate)
                         torch.cuda.empty_cache()
             del single_weights
-            # gc.collect()
             torch.cuda.empty_cache()
     torch.cuda.empty_cache()
     return weighted_single_weights
@@ -438,7 +394,6 @@ def FlexLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch, cl
     return weighted_single_weights
 
 
-# fed_utils/model_aggregation.py (append)
 
 import json
 from .rank_allocator import allocate_r_tot_for_client, allocate_r_main_for_client
@@ -555,7 +510,7 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                     if ('local' in key) and ('bias' not in key) and ('lora_A' in key):
                         B_key = key.replace('lora_A', 'lora_B')
                         rank = int(state[B_key].shape[1])
-                        merge_rate = float(lora_alpha) / float(max(rank, 1))  # 修正：别写死16
+                        merge_rate = float(lora_alpha) / float(max(rank, 1))
                         base_key = '.'.join(key.split('.')[:-3]) + '.lora'
                         merged = (state[B_key] @ state[key]) * merge_rate * weights_array[k]
                         aggregated[base_key] = aggregated.get(base_key, 0) + merged.to("cpu")
@@ -564,7 +519,6 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                 torch.cuda.empty_cache()
 
         else:
-            # unbiased: W_{t+1} = W_t + Σ p_i (W_i^{t+1} - W_t^{r_i})
             delta_sum = {}
             for k, client_id in tqdm(enumerate(selected_clients_set)):
                 local_path = os.path.join(output_dir, str(client_id),
@@ -607,7 +561,6 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
     if use_atw:
         logging.info("[FedHera] Computing ATW alignment scores with Trace Optimization...")
 
-        # 1. 计算全局 Global Norm
         global_sq_norm = 0.0
         for g_tensor in aggregated.values():
             global_sq_norm += torch.linalg.norm(g_tensor.float()) ** 2
@@ -628,7 +581,6 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                 key_A = None
                 key_B = None
                 
-                # 寻找对应的 A 和 B
                 for k in state.keys():
                     if prefix in k and 'lora_A' in k:
                         key_A = k
@@ -643,17 +595,10 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                     rank = B_mat.shape[1]
                     merge_rate = 16 / max(rank, 1)
                     
-                    # --- 优化1: Dot Product ---
-                    # 计算 <BA, G> = Tr(A^T B^T G)
-                    # 先算 (B^T G) -> (r, k)
                     temp_res = B_mat.T @ G_mat 
-                    # 再算 sum(A * temp_res)
                     contribution = torch.sum(A_mat * temp_res).item()
                     dot_product += contribution * merge_rate
                     
-                    # --- 优化2: Client Norm ---
-                    # 计算 ||BA||^2 = Tr((B^T B)(A A^T))
-                    # 这一步避免了生成 (d, k) 的大矩阵，全程只处理 (r, r) 的小矩阵
                     BT_B = B_mat.T @ B_mat   # (r, r)
                     A_AT = A_mat @ A_mat.T   # (r, r)
                     trace_norm = torch.sum(BT_B * A_AT).item()
@@ -662,13 +607,11 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
 
             client_norm = math.sqrt(client_sq_norm)
             
-            # Cosine Sim
             if global_norm > 1e-6 and client_norm > 1e-6:
                 s_i = dot_product / (global_norm * client_norm)
             else:
                 s_i = 0.0
             
-            # Update Cache
             FEDHERA_CLIENT_STATS[int(client_id)] = {"s": s_i, "t": epoch}
             del state
 
@@ -744,30 +687,24 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             r_main, _, _ = allocate_r_main_for_client(layers, r_tot, M_bytes, T_ms, c_mem_per_col, c_time_per_col)
 
         # [ATW Logic] Calculate Lambda for this client
-        lambda_val = 1.0 # Default Static
+        lambda_val = 1.0
         if use_atw:
-            # Retrieve cached stats
             stat = FEDHERA_CLIENT_STATS.get(int(client_id), {"s": 0.0, "t": -1})
             s_stored = stat["s"]
             t_hat = stat["t"]
             
-            beta = 0.9 # Hardcoded per requirement
+            beta = 0.9
             
-            # Note: For selected clients, t_hat == epoch because we just updated it.
-            # So decay factor beta^(epoch - epoch) == 1. This uses the fresh score.
-            # The formula works for stale clients too if we were to serve them.
             
             current_round = epoch + 1
             decay = beta ** (epoch - t_hat)
             
-            # Formula: 1 - exp( - (1 + s * beta^(t-that)) * t / T_warmup )
             exponent = -1.0 * (1.0 + s_stored * decay) * current_round / atw_temperature
             lambda_val = 1.0 - math.exp(exponent)
             
-            # Clip for safety
             lambda_val = max(0.0, min(1.0, lambda_val))
             
-            if client_id == sorted(list(selected_clients_set))[0]: # Log once per round
+            if client_id == sorted(list(selected_clients_set))[0]:
                 logging.info(f"[ATW] Client {client_id}: s={s_stored:.4f}, lambda={lambda_val:.4f}")
 
         push_dir = os.path.join(output_dir, str(client_id), f"server_push_epoch_{epoch}")
@@ -806,7 +743,7 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                 "quant_main": quant_main,
                 "quant_res": quant_res,
                 "ablation": ablation_mode,
-                "lambda": lambda_val # Write lambda to meta
+                "lambda": lambda_val
             }
             del U, S, Vh, B, A
         
@@ -815,7 +752,6 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             json.dump(meta, f)
         torch.cuda.empty_cache()
 
-        # Track communication/compute stats...
         client_transmit_bytes = 0.0
         client_compute_bytes = 0.0
         comp_time_ms = 0.0
@@ -832,7 +768,6 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                 spec = layer_specs[layer_key]
                 d_out = spec.get("d_out")
                 d_in = spec.get("d_in")
-            # Fallback to shapes from the stored tensors if specs are missing.
             if (d_out is None or d_in is None) and pkg:
                 Akey = layer_key + "_A.local.weight"
                 Bkey = layer_key + "_B.local.weight"
@@ -887,23 +822,15 @@ def FedHL(selected_clients_set, output_dir, local_dataset_len_dict, epoch, prev_
     """
     logging.info(f"[FedHL] Starting aggregation for epoch {epoch}")
     
-    # 1. 预计算全局模型 W_t 的 SVD 信息 (用于计算 truncation error 和 W_t^{r_i})
-    # prev_global_params 是 W_t (Dense weights)
-    # 我们按层缓存 SVD 结果： {layer_key: (U, S, Vh, S_squared_sum)}
     layer_svd_cache = {}
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    # 筛选出需要 LoRA 的层 (即存在于 global_params 中的层)
-    # 注意：prev_global_params 通常是完整的 state_dict 或仅包含 adapter 对应的 dense weight
-    # 这里假设 prev_global_params 是 dense weight 字典
+    client_ranks = {} 
+    client_errors = {} 
+    client_updates_cache = {} 
     
-    # 2. 第一遍循环：收集所有客户端的 Rank 信息，计算 Truncation Error (\hat{r}_i)
-    client_ranks = {}      # client_id -> {layer_key: rank}
-    client_errors = {}     # client_id -> total_truncation_error
-    client_updates_cache = {} # 缓存加载的客户端模型，避免重复 IO
-    
-    epsilon = 1e-6 # 防止除零
+    epsilon = 1e-6
     
     for client_id in tqdm(selected_clients_set, desc="[FedHL] Computing Errors"):
         single_output_dir = os.path.join(output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin")
@@ -917,68 +844,45 @@ def FedHL(selected_clients_set, output_dir, local_dataset_len_dict, epoch, prev_
         total_error = 0.0
         
         for key in single_weights.keys():
-            # 识别 LoRA A 矩阵
             if 'local' in key and 'lora_A' in key:
                 base_key = '.'.join(key.split('.')[:-3]) + '.lora'
                 B_key = key.replace('lora_A', 'lora_B')
                 
-                # 获取 Client Rank
                 rank = single_weights[key].shape[0] # A is [r, d_in]
                 current_client_ranks[base_key] = rank
                 
-                # 确保全局模型中有该层，并计算 SVD
                 if base_key not in prev_global_params:
-                    # 可能是新层或者命名不匹配，暂时跳过
                     continue
                 
                 if base_key not in layer_svd_cache:
-                    # 计算 SVD 并缓存
                     W_t_layer = prev_global_params[base_key].to(device).float()
-                    # 使用 full_matrices=False 以节省显存
                     U, S, Vh = torch.linalg.svd(W_t_layer, full_matrices=False)
                     layer_svd_cache[base_key] = (U.cpu(), S.cpu(), Vh.cpu())
                     del W_t_layer
                     torch.cuda.empty_cache()
                 
-                # 计算 Truncation Error: || W_t - W_t^r ||^2
-                # 等价于 sum(sigma_{r+1}^2 ... sigma_{end}^2)
                 _, S, _ = layer_svd_cache[base_key]
-                # S 是奇异值向量，从大到小排列
                 truncated_singular_values = S[rank:]
                 layer_error = torch.sum(truncated_singular_values ** 2).item()
                 total_error += layer_error
                 
         client_ranks[client_id] = current_client_ranks
         client_errors[client_id] = total_error
-
-    # 3. 计算最优聚合权重 p_i (Theorem 3)
-    # p_i* = (1 / (error_i^2 + eps)) / sum(...)
-    # 注意：论文中 error 定义为 \hat{r}_i = ||...||^2，所以这里直接用 total_error
     
     p_numerators = {}
     p_denom_sum = 0.0
     
     for cid in selected_clients_set:
         err = client_errors.get(cid, 0.0)
-        # 论文公式 (15): p_i = (1 / (r_i^2 + epsilon)) ... 这里的 r_i 指的是 truncation error \hat{r}_i
-        # 因为我们上面算的 total_error 已经是 ||...||^2 了，所以这里直接用 total_error
-        # 但论文写的是 \hat{r}_i^2，我们需要确认 \hat{r}_i 是定义为范数还是范数平方。
-        # 论文 Eq(8): \hat{r}_i(t) = || W - W^r ||^2. 
-        # Theorem 3 Eq(15) 分母是 \hat{r}_i^2 + epsilon. 这里的 \hat{r}_i 指代上面的定义。
-        # 所以是 (Error)^2.
-        
         val = 1.0 / ( (err ** 2) + epsilon )
         p_numerators[cid] = val
         p_denom_sum += val
         
     optimal_weights = {cid: val / p_denom_sum for cid, val in p_numerators.items()}
     
-    # 记录权重信息
     log_weights = {cid: f"{w:.4f}" for cid, w in optimal_weights.items()}
     logging.info(f"[FedHL] Aggregation Weights: {str(log_weights)}")
 
-    # 4. 执行聚合: W_{t+1} = W_t + sum( p_i * (W_{t+1}^i - W_t^{r_i}) )
-    # 初始化 Delta accumulator
     global_delta = {k: torch.zeros_like(v, device='cpu') for k, v in prev_global_params.items()}
     
     for client_id in tqdm(selected_clients_set, desc="[FedHL] Aggregating"):
@@ -994,23 +898,14 @@ def FedHL(selected_clients_set, output_dir, local_dataset_len_dict, epoch, prev_
                 if base_key not in layer_svd_cache:
                     continue
                     
-                # 1. 重构客户端模型 W_{t+1}^i = B @ A
                 B_mat = single_weights[B_key].float()
                 A_mat = single_weights[key].float()
                 
                 rank = ranks[base_key]
-                # 注意：Adaptive PEFT 代码中，forward 包含 scaling (alpha/r)。
-                # 但 distribute_weight_fast 通常把 scaling 并在 B 或 A 里。
-                # 检查 FlexLoRA/FLoRA 实现，通常需要在聚合时乘 merge_rate。
-                # 在本代码库的 FL_training 中，distribute_weight_fast 使用 weight_dict[..._B...] = lora_B / merge_rate
-                # 意味着存储的权重被除过了，forward 时乘回来。
-                # 这里我们需要恢复其数学上的值用于加减。
-                merge_rate = 16.0 / max(rank, 1) # assuming alpha=16
+                merge_rate = 16.0 / max(rank, 1) 
                 
-                # W_client = (B @ A) * scale
                 W_client = (B_mat @ A_mat) * merge_rate
                 
-                # 2. 重构初始截断模型 W_t^{r_i} = U_r S_r V_r^T
                 U, S, Vh = layer_svd_cache[base_key]
                 U_r = U[:, :rank]
                 S_r = S[:rank]
@@ -1018,26 +913,19 @@ def FedHL(selected_clients_set, output_dir, local_dataset_len_dict, epoch, prev_
                 
                 W_truncated = (U_r @ torch.diag(S_r) @ Vh_r)
                 
-                # 3. 计算差异 Delta = p_i * (W_client - W_truncated)
                 diff = (W_client - W_truncated) * weight
                 
-                # 累加到 Global Delta
                 if base_key in global_delta:
                     global_delta[base_key] += diff
                 
-    # 5. 更新全局模型: W_{t+1} = W_t + Delta
     new_global_params = {}
     for k, v in prev_global_params.items():
         if k in global_delta:
-            # 关键：使用 .detach().clone() 确保新 Tensor 是 leaf tensor，且内存独立
-            # 将 W_t + Delta 的结果剥离出计算图
             updated_tensor = (v + global_delta[k]).detach().clone()
             new_global_params[k] = updated_tensor
         else:
-            # 对于没有更新的参数，也进行 detach clone 以防万一
             new_global_params[k] = v.detach().clone()
             
-    # 清理缓存
     del layer_svd_cache
     del client_updates_cache
     gc.collect()
