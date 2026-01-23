@@ -199,6 +199,8 @@ def read_options():
                         help='output directory to store model and experiment result')
     parser.add_argument('--session_name', default='test', type=str,
                         help='name for your experiment')
+    parser.add_argument('--log_dir', default='./logs', type=str,
+                        help='directory to store training logs')
     parser.add_argument('--seed', default=42, type=int,
                         help='random seed')
     parser.add_argument('--save_model', action='store_true', default=False,
@@ -885,7 +887,7 @@ def main():
     seed_torch(args.seed, deterministic=args.deterministic)
     if not os.path.exists(args.session_name):
         os.makedirs(args.session_name)
-    log_dir = "/root/nfs/fedhera"
+    log_dir = os.path.expanduser(args.log_dir)
     os.makedirs(log_dir, exist_ok=True)
     model_tag = os.path.basename(str(args.global_model)).replace("/", "_")
     dataset_tag = os.path.basename(os.path.normpath(args.data_path))
