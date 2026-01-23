@@ -221,11 +221,11 @@ def read_options():
     parser.add_argument('--basis_update_every', default=1, type=int)
     parser.add_argument('--baseline', default='fedavg', type=str,
                         help='type of FL baseline to choose', choices=['fedavg', 'fedit'])
-    parser.add_argument('--client_selection_frac', default=0.05, type=float,
+    parser.add_argument('--client_selection_frac', default=0.4, type=float,
                         help='ratio of how many clients participate in each round')
-    parser.add_argument('--num_clients', default=1613, type=int,
+    parser.add_argument('--num_clients', default=20, type=int,
                         help='total number of clients')
-    parser.add_argument('--num_communication_rounds', default=50, type=int,
+    parser.add_argument('--num_communication_rounds', default=10, type=int,
                         help='total number of communication rounds')
     parser.add_argument('--R_1', default=5, type=int,
                         help='Parameter for SLoRA. Total number of rounds for stage 1 sparse finetuning.')
@@ -267,11 +267,8 @@ def read_options():
                         help='LoRA alpha')
     parser.add_argument('--lora_dropout', default=0.05, type=float,
                         help='LoRA dropout')
-    parser.add_argument('--lora_target_modules',
-                        default=None,
-                        type=parse_lora_target_modules,
-                        help='lora_target_modules (JSON list or comma-separated); omit for model-specific defaults',
-                        )
+    parser.add_argument('--lora_target_modules', default=None, type=parse_lora_target_modules,
+                        help='lora_target_modules (JSON list or comma-separated); omit for model-specific defaults',)
     parser.add_argument('--use_atw', action='store_true', default=False,
                         help='Enable Adaptive Tail Warm-up (ATW) for FedHera. '
                              'If False, lambda is fixed to 1.0 (Static Tail).')
@@ -281,14 +278,11 @@ def read_options():
                         help='Whether to calculate drift against a high-rank Oracle (Very slow!).')
     parser.add_argument('--oracle_rank', default=512, type=int, help='Rank for the Oracle baseline.')
     parser.add_argument('--fedhera_server_agg', default='original', type=str, choices=['original', 'unbiased'],
-        help=(
-            "FedHera server-side aggregation. original: W_{t+1}=Σ p_i W_i. unbiased: FedHL-style W_{t+1}=W_t+Σ p_i (W_i^{t+1}-W_t^{r_i}), "
-            "where W_t^{r_i} is the last-round server_push for each client."))
+                        help=("FedHera server-side aggregation. "))
 
 
-    # --- Evaluation protocol (community metrics) ---
-    parser.add_argument('--eval_protocol', default='auto', type=str,
-                        choices=['auto', 'gen', 'legacy_tf'],
+    # --- Evaluation protocol ---
+    parser.add_argument('--eval_protocol', default='auto', type=str, choices=['auto', 'gen', 'legacy_tf'],
                         help='Evaluation protocol: gen=use model.generate() metrics, legacy_tf=teacher-forcing argmax decode, auto=choose gen')
     parser.add_argument('--eval_answer_only_loss', action='store_true', default=False,
                         help='If set, eval/test loss masks the prompt and computes answer-only NLL (recommended).')
