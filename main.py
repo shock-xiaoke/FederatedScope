@@ -690,7 +690,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                     hera_hooks = None
 
 
-            if (epoch > 0 or args.aggregation == 'fedhl') and args.aggregation != 'fedhera':
+            if (epoch > 0 or args.aggregation == 'fedhl') and args.aggregation != 'fedhera' and global_params is not None:
                 local_client_load_weight(args, model, epoch, global_params=global_params)
 
             active_layers = None
@@ -885,7 +885,7 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
     model_tag = os.path.basename(str(args.global_model)).replace("/", "_")
     dataset_tag = os.path.basename(os.path.normpath(args.data_path))
-    log_name = f"{args.aggregation}_{args.hetero_mode}_{model_tag}_{dataset_tag}_r{args.lora_r}.log"
+    log_name = f"{args.aggregation}_{args.hetero_mode}_{model_tag}_{dataset_tag}_r{args.lora_r}_{args.dirichlet_alpha}.log"
     log_path = os.path.join(log_dir, log_name)
     logging.basicConfig(filename=log_path,
                         level=logging.INFO,
