@@ -235,6 +235,8 @@ def read_options():
                         help='Early stop patience.')
     parser.add_argument('--resume_epoch', default=None, type=int,
                         help='continue training from an existing experiment, specifying which comm round to resume')
+    parser.add_argument('--dirichlet_alpha', default=None, type=float,
+                        help='Optional Dirichlet alpha for non-IID data selection. If set (e.g., 0.5), it appends "_noniid_0.5" to data_path.')
     
     ## Local training parameters
     parser.add_argument('--local_batch_size', default=4, type=int,
@@ -872,6 +874,10 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
 
 def main():
     args = read_options()
+    if args.dirichlet_alpha is not None:
+        raw_path = args.data_path.rstrip('/')
+        args.data_path = f"{raw_path}_noniid_{args.dirichlet_alpha}"
+        logging.info(f"Dirichlet alpha={args.dirichlet_alpha} detected. Switching data_path to: {args.data_path}")
     seed_torch(args.seed, deterministic=args.deterministic)
     if not os.path.exists(args.session_name):
         os.makedirs(args.session_name)
