@@ -2,7 +2,8 @@ import argparse
 import json
 import os
 from typing import List, Dict, Any, Tuple
-
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import MiniBatchKMeans
 import numpy as np
 from datasets import load_dataset, Dataset
 
@@ -10,6 +11,80 @@ from datasets import load_dataset, Dataset
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
+
+def _partition_data_dirichlet(
+    records: List[Dict[str, Any]],
+    num_clients: int,
+    alpha: float,
+    seed: int = 42,
+    n_classes: int = 10,
+    train_ratio: float = 0.8,
+    eval_ratio: float = 0.1,
+) -> Dict[int, Dict[str, List[Dict[str, Any]]]]:
+    rng = np.random.default_rng(seed)
+    
+    print(f"Executing Dirichlet partition with alpha={alpha}...")
+
+    corpus = [r["instruction"] + " " + r["input"] for r in records]
+    
+    print("Vectorizing text for clustering...")
+    vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
+    X = vectorizer.fit_transform(corpus)
+    
+    print(f"Clustering data into {n_classes} topics...")
+    kmeans = MiniBatchKMeans(n_clusters=n_classes, random_state=seed, batch_size=256)
+    labels = kmeans.fit_predict(X)
+    
+    idxs_by_class = {k: [] for k in range(n_classes)}
+    for idx, label in enumerate(labels):
+        idxs_by_class[label].append(idx)
+        
+    min_size = 0
+    
+    client_data_idxs = [[] for _ in range(num_clients)]
+    
+    for k in range(n_classes):
+        idx_k = idxs_by_class[k]
+        rng.shuffle(idx_k)
+        
+        proportions = rng.dirichlet(np.repeat(alpha, num_clients))
+        
+        proportions = np.array([p * (1 if len(idx_k) < num_clients else len(idx_k)) for p in proportions])
+        proportions = proportions / proportions.sum()
+        proportions = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
+        
+        splits = np.split(idx_k, proportions)
+        for cid in range(num_clients):
+            client_data_idxs[cid].extend(splits[cid].tolist())
+
+    out: Dict[int, Dict[str, List[Dict[str, Any]]]] = {}
+    
+    for cid in range(num_clients):
+        client_indices = client_data_idxs[cid]
+        rng.shuffle(client_indices)
+        
+        client_records = [records[i] for i in client_indices]
+        
+        n = len(client_records)
+        if n == 0:
+            print(f"Warning: Client {cid} received no data!")
+            out[cid] = {"train": [], "eval": [], "test": []}
+            continue
+            
+        n_train = int(n * train_ratio)
+        n_eval = int(n * eval_ratio)
+
+        train = client_records[:n_train]
+        eval_ = client_records[n_train:n_train + n_eval]
+        test = client_records[n_train + n_eval:]
+
+        out[cid] = {
+            "train": train,
+            "eval": eval_,
+            "test": test,
+        }
+        
+    return out
 
 def _to_fedhera_example_mathqa(example: Dict[str, Any]) -> Dict[str, Any]:
     """Map a MetaMathQA-style record to (instruction, input, output)."""
@@ -319,6 +394,7 @@ def preprocess_task(
     max_examples: int | None,
     seed: int = 42,
     hf_config: str | None = None,
+    alpha: float | None = None,
 ) -> None:
     ds = _load_source_dataset(task, hf_dataset, data_files, split, hf_config)
 
@@ -353,7 +429,13 @@ def preprocess_task(
         if rec["instruction"] and rec["output"]:
             records.append(rec)
 
-    splits = _split_across_clients(records, num_clients=num_clients, seed=seed)
+    if alpha is not None and alpha > 0:
+        print(f"Partitioning data with Dirichlet alpha={alpha}...")
+        splits = _partition_data_dirichlet(records, num_clients=num_clients, alpha=alpha, seed=seed)
+    else:
+        print("Partitioning data uniformly (IID)...")
+        splits = _split_across_clients(records, num_clients=num_clients, seed=seed)
+        
     _save_client_splits(splits, output_root=output_root, num_clients=num_clients)
 
 
@@ -426,6 +508,12 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed for shuffling and client splitting.",
     )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="Dirichlet alpha for non-IID partition. If None, uses uniform IID split. (e.g., 10, 0.5, 0.1)",
+    )
     return parser.parse_args()
 
 
@@ -441,6 +529,7 @@ def main() -> None:
         max_examples=args.max_examples,
         seed=args.seed,
         hf_config=args.hf_config,
+        alpha=args.alpha,
     )
 
 
