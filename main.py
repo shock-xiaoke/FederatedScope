@@ -874,10 +874,6 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
 
 def main():
     args = read_options()
-    if args.dirichlet_alpha is not None:
-        raw_path = args.data_path.rstrip('/')
-        args.data_path = f"{raw_path}_noniid_{args.dirichlet_alpha}"
-        logging.info(f"Dirichlet alpha={args.dirichlet_alpha} detected. Switching data_path to: {args.data_path}")
     seed_torch(args.seed, deterministic=args.deterministic)
     if not os.path.exists(args.session_name):
         os.makedirs(args.session_name)
@@ -892,6 +888,10 @@ def main():
                         format='%(message)s')
     logging.info("Logging to %s", log_path)
     logging.info("Initial training parameters %s", args)
+    if args.dirichlet_alpha is not None:
+        raw_path = args.data_path.rstrip('/')
+        args.data_path = f"{raw_path}_noniid_{args.dirichlet_alpha}"
+        logging.info(f"Dirichlet alpha={args.dirichlet_alpha} detected. Switching data_path to: {args.data_path}")
     print(args)
 
 
