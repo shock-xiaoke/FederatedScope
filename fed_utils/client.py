@@ -137,6 +137,7 @@ class GeneralClient:
             logging_steps=1,
             optim=self.optim,
             eval_strategy="epoch",
+            prediction_loss_only=True,
             save_strategy="no",
             output_dir=self.local_output_dir,
             group_by_length=group_by_length,
