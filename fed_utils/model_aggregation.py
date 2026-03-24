@@ -13,6 +13,7 @@ from tqdm import tqdm
 # summarise total communication and compute volume.
 TRAFFIC_STATS = {
     "FlexLoRA": {"transmit_MB": 0.0, "compute_MB": 0.0},
+    "HetLoRA": {"transmit_MB": 0.0, "compute_MB": 0.0},
     "FedHera": {"transmit_MB": 0.0, "compute_MB": 0.0},
     "FedHeLLo": {"transmit_MB": 0.0, "compute_MB": 0.0},
     "FLoRA": {"transmit_MB": 0.0, "compute_MB": 0.0},
@@ -33,6 +34,186 @@ def get_traffic_stats():
         name: stats.copy()
         for name, stats in TRAFFIC_STATS.items()
     }
+
+
+def _resolve_client_rank(client_rank_map, client_id):
+    if client_rank_map is None:
+        return 0
+    rank_info = client_rank_map.get(int(client_id), client_rank_map.get(client_id, 0))
+    if isinstance(rank_info, dict):
+        vals = [int(v) for v in rank_info.values() if int(v) > 0]
+        return max(vals) if vals else 0
+    if isinstance(rank_info, (list, tuple)):
+        vals = [int(v) for v in rank_info if int(v) > 0]
+        return max(vals) if vals else 0
+    try:
+        return int(rank_info)
+    except Exception:
+        return 0
+
+
+def HetLoRA(
+    selected_clients_set,
+    output_dir,
+    local_dataset_len_dict,
+    epoch,
+    client_rank_map,
+    target_global_rank,
+    prev_global_params=None,
+    client_budgets=None,
+    layer_specs=None,
+):
+    """
+    HetLoRA baseline:
+    1. Compute each participating client's sparsity score ||B_k A_k||_F.
+    2. Normalize scores to aggregation weights.
+    3. Zero-pad heterogeneous LoRA A/B into a shared global rank.
+    4. Aggregate directly in factor space without SVD redistribution.
+    """
+    if not selected_clients_set:
+        return prev_global_params if prev_global_params is not None else {}
+
+    selected_clients = list(selected_clients_set)
+    target_global_rank = int(max(1, target_global_rank))
+    client_loaded_weights = {}
+    client_scores = {}
+
+    round_transmit_bytes = 0.0
+    round_compute_bytes = 0.0
+    compute_ms_per_param = 1.7e-04
+    MB = 1024.0 * 1024.0
+
+    for client_id in tqdm(selected_clients, desc="HetLoRA Aggregation"):
+        rank = _resolve_client_rank(client_rank_map, client_id)
+        model_path = os.path.join(output_dir, str(client_id), f"local_output_epoch_{epoch}", "pytorch_model.bin")
+        if not os.path.exists(model_path):
+            logging.warning("[HetLoRA][epoch %d] Missing model for client %s: %s", epoch, str(client_id), model_path)
+            client_scores[int(client_id)] = 0.0
+            continue
+
+        state = torch.load(model_path, map_location="cpu")
+        client_loaded_weights[int(client_id)] = state
+
+        total_norm_squared = 0.0
+        for key in list(state.keys()):
+            if 'local' not in key or 'bias' in key or 'lora_A' not in key:
+                continue
+            B_key = key.replace('lora_A', 'lora_B')
+            if B_key not in state:
+                continue
+
+            lora_A = state[key].float()
+            lora_B = state[B_key].float()
+            client_rank = int(lora_A.shape[0])
+            if client_rank <= 0 or client_rank != int(lora_B.shape[1]):
+                continue
+
+            BT_B = torch.matmul(lora_B.T, lora_B)
+            BT_B_A = torch.matmul(BT_B, lora_A)
+            total_norm_squared += torch.sum(lora_A * BT_B_A).item()
+
+            d_in = int(lora_A.shape[1])
+            d_out = int(lora_B.shape[0])
+            elem_bytes = lora_A.element_size()
+            bytes_this = float((d_in + d_out) * client_rank * elem_bytes)
+            round_transmit_bytes += bytes_this
+            round_compute_bytes += bytes_this
+
+        client_scores[int(client_id)] = math.sqrt(max(total_norm_squared, 0.0))
+
+        if client_budgets is not None:
+            budget = client_budgets.get(int(client_id)) if isinstance(client_budgets, dict) else None
+            if budget is not None:
+                comm_bytes = 0.0
+                comp_time_ms = 0.0
+                for key in list(state.keys()):
+                    if 'local' not in key or 'bias' in key or 'lora_A' not in key:
+                        continue
+                    B_key = key.replace('lora_A', 'lora_B')
+                    if B_key not in state:
+                        continue
+                    A_w = state[key]
+                    B_w = state[B_key]
+                    layer_rank = int(A_w.shape[0])
+                    base_key = '.'.join(key.split('.')[:-3]) + '.lora'
+                    d_out = int(B_w.shape[0])
+                    d_in = int(A_w.shape[1])
+                    if layer_specs is not None and base_key in layer_specs:
+                        spec = layer_specs[base_key]
+                        d_out = int(spec.get("d_out", d_out))
+                        d_in = int(spec.get("d_in", d_in))
+                    comm_bytes += float(layer_rank * (d_in + d_out) * 2.0)
+                    comp_time_ms += float(layer_rank * (d_in + d_out) * compute_ms_per_param)
+
+                B_down_bytes = float(budget.get("B_down_MB", 0.0)) * MB
+                T_ms = float(budget.get("step_ms", 0.0))
+                comm_util = (comm_bytes / B_down_bytes) if B_down_bytes > 0 else 0.0
+                comp_util = (comp_time_ms / T_ms) if T_ms > 0 else 0.0
+                logging.info(
+                    "[HetLoRA][epoch %d][client %s] score=%.6f Comm Util: %.1f%%, Comp Util: %.1f%%",
+                    epoch,
+                    str(client_id),
+                    client_scores[int(client_id)],
+                    comm_util * 100.0,
+                    comp_util * 100.0,
+                )
+
+    valid_client_ids = [cid for cid in selected_clients if int(cid) in client_loaded_weights]
+    if not valid_client_ids:
+        return prev_global_params if prev_global_params is not None else {}
+
+    denom = sum(client_scores.get(int(cid), 0.0) for cid in valid_client_ids)
+    if denom <= 0:
+        agg_weights = {int(cid): 1.0 / len(valid_client_ids) for cid in valid_client_ids}
+        logging.info("[HetLoRA][epoch %d] All client scores are zero; using uniform weights.", epoch)
+    else:
+        agg_weights = {
+            int(cid): client_scores.get(int(cid), 0.0) / denom
+            for cid in valid_client_ids
+        }
+
+    aggregated_params = {}
+    template_state = prev_global_params if prev_global_params else client_loaded_weights[int(valid_client_ids[0])]
+    for key, param in template_state.items():
+        if 'lora_A' in key:
+            aggregated_params[key] = torch.zeros((target_global_rank, int(param.shape[1])), dtype=param.dtype)
+        elif 'lora_B' in key:
+            aggregated_params[key] = torch.zeros((int(param.shape[0]), target_global_rank), dtype=param.dtype)
+        else:
+            aggregated_params[key] = torch.zeros_like(param, device='cpu')
+
+    for client_id in valid_client_ids:
+        state = client_loaded_weights[int(client_id)]
+        weight = float(agg_weights[int(client_id)])
+        for key, param in state.items():
+            if key not in aggregated_params:
+                continue
+            tensor = param.detach().to('cpu')
+            if 'lora_A' in key:
+                rank = min(int(tensor.shape[0]), target_global_rank)
+                aggregated_params[key][:rank, :] += tensor[:rank, :] * weight
+            elif 'lora_B' in key:
+                rank = min(int(tensor.shape[1]), target_global_rank)
+                aggregated_params[key][:, :rank] += tensor[:, :rank] * weight
+            else:
+                if aggregated_params[key].shape == tensor.shape:
+                    aggregated_params[key] += tensor * weight
+
+    logging.info(
+        "[HetLoRA][epoch %d] target_global_rank=%d weights=%s",
+        epoch,
+        target_global_rank,
+        {cid: round(w, 6) for cid, w in sorted(agg_weights.items())},
+    )
+    TRAFFIC_STATS["HetLoRA"]["transmit_MB"] += round_transmit_bytes / MB
+    TRAFFIC_STATS["HetLoRA"]["compute_MB"] += round_compute_bytes / MB
+    logging.info(
+        "[HetLoRA][epoch %d] transmit_MB=%.3f compute_MB=%.3f",
+        epoch,
+        round_transmit_bytes / MB,
+        round_compute_bytes / MB,
+    )
+    return aggregated_params
 
 def FLoRA(selected_clients_set, output_dir, local_dataset_len_dict, epoch, client_budgets=None, layer_specs=None):
     """

@@ -5,8 +5,8 @@ from peft import (
     get_peft_model,
     prepare_model_for_kbit_training,
 )
-from fed_utils import FedAvg, client_selection, seed_torch, GeneralClient, FlexLoRA, \
-    load_weight_local, distribute_weight_fast, modify_adapter, FedHera, FedHeLLo, FLoRA, FedHL
+from fed_utils import FedAvg, client_selection, seed_torch, GeneralClient, FlexLoRA, HetLoRA, \
+    load_weight_local, load_weight_hetlora, distribute_weight_fast, modify_adapter, FedHera, FedHeLLo, FLoRA, FedHL
 from fed_utils.model_aggregation import reset_traffic_stats, get_traffic_stats, TRAFFIC_STATS
 
 import datasets
@@ -214,7 +214,7 @@ def read_options():
     ## FL parameters
     parser.add_argument('--aggregation', default='homo', type=str,
                         help='aggregation method',
-                        choices=['homo', 'flexlora', 'fedhera', 'fedhello', 'flora', 'fedhl'])
+                        choices=['homo', 'flexlora', 'hetlora', 'fedhera', 'fedhello', 'flora', 'fedhl'])
     parser.add_argument('--hetero_mode', default='setting_B', type=str,
                         choices=['setting_A', 'setting_B'],
                         help='resource heterogeneity preset for Fed-Hera/FlexLoRA')
@@ -459,6 +459,9 @@ def local_client_load_weight(args, model, epoch, global_params=None):
     """
     if args.aggregation in ['homo', 'fedhello']:
         _ = model.load_state_dict(global_params, strict=False)
+    elif args.aggregation == 'hetlora':
+        local_weight = load_weight_hetlora(global_params, model)
+        _ = model.load_state_dict(local_weight, strict=False)
     else:
         local_weight = load_weight_local(global_params, model)
         _ = model.load_state_dict(local_weight, strict=False)
@@ -509,6 +512,18 @@ def resume(args, data_path, output_dir, config_local):
             layer_specs=FL_training.layer_specs,
         )
         global_params = distribute_weight_fast(global_params, config_local)
+    elif args.aggregation == 'hetlora':
+        global_params = HetLoRA(
+            selected_clients_set,
+            output_dir,
+            local_dataset_len_dict,
+            args.resume_epoch - 1,
+            client_rank_map=config_local,
+            target_global_rank=getattr(FL_training, "hetlora_global_rank", args.lora_r),
+            prev_global_params=None,
+            client_budgets=FL_training.client_budgets,
+            layer_specs=FL_training.layer_specs,
+        )
     elif args.aggregation == 'flora':
             # 1. Aggregate via Stacking (FLoRA specific)
             global_params = FLoRA(selected_clients_set,
@@ -809,6 +824,20 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             if args.save_model:
                 torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
             global_params = distribute_weight_fast(global_params, config_local)
+        elif args.aggregation == 'hetlora':
+            global_params = HetLoRA(
+                selected_clients_set,
+                output_dir,
+                local_dataset_len_dict,
+                epoch,
+                client_rank_map=config_local,
+                target_global_rank=getattr(FL_training, "hetlora_global_rank", args.lora_r),
+                prev_global_params=global_params,
+                client_budgets=FL_training.client_budgets,
+                layer_specs=FL_training.layer_specs,
+            )
+            if args.save_model:
+                torch.save(global_params, os.path.join(output_dir, "adapter_model.bin"))
         elif args.aggregation == 'flora':
             global_params = FLoRA(selected_clients_set,
                                   output_dir,
@@ -940,6 +969,9 @@ def main():
     elif args.aggregation == 'flexlora':
         logging.info("Calculating FlexLoRA ranks based on client budgets...")
         fixed_ranks = calculated_ranks
+    elif args.aggregation == 'hetlora':
+        logging.info("Calculating HetLoRA ranks based on client budgets...")
+        fixed_ranks = calculated_ranks
     elif args.aggregation == 'flora':
         logging.info("Calculating FLoRA ranks based on client budgets (Same as FlexLoRA)...")
         fixed_ranks = calculated_ranks
@@ -962,6 +994,8 @@ def main():
         seed=args.seed,
         fixed_ranks=fixed_ranks,
     )
+    if args.aggregation == 'hetlora':
+        FL_training.hetlora_global_rank = max(calculated_ranks.values()) if calculated_ranks else int(args.lora_r)
 
     logging.info(config_local)
 

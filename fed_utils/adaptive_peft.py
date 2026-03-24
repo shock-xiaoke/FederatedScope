@@ -51,6 +51,36 @@ def load_weight_local(weighted_single_weights, model):
     return weight_dict
 
 
+def load_weight_hetlora(global_params, model):
+    """
+    Truncate a shared HetLoRA global adapter to the current client's local rank.
+    """
+    weight_dict = {}
+    if global_params is None:
+        return weight_dict
+    for name, param in model.named_parameters():
+        if not param.requires_grad or name not in global_params:
+            continue
+        src = global_params[name].detach().to(device='cpu', dtype=param.dtype)
+        if "lora_A" in name:
+            local_rank = int(param.shape[0])
+            copy_rank = min(local_rank, int(src.shape[0]))
+            tensor = torch.zeros_like(param, device='cpu')
+            if copy_rank > 0:
+                tensor[:copy_rank, :] = src[:copy_rank, :]
+            weight_dict[name] = tensor
+        elif "lora_B" in name:
+            local_rank = int(param.shape[1])
+            copy_rank = min(local_rank, int(src.shape[1]))
+            tensor = torch.zeros_like(param, device='cpu')
+            if copy_rank > 0:
+                tensor[:, :copy_rank] = src[:, :copy_rank]
+            weight_dict[name] = tensor
+        elif tuple(src.shape) == tuple(param.shape):
+            weight_dict[name] = src.clone()
+    return weight_dict
+
+
 def distribute_weight(weighted_single_weights, model):
     # mode is local model
     # around 15 min for one client
