@@ -136,7 +136,7 @@ class GeneralClient:
             bf16=use_bf16,
             logging_steps=1,
             optim=self.optim,
-            evaluation_strategy="epoch",
+            eval_strategy="epoch",
             save_strategy="no",
             output_dir=self.local_output_dir,
             group_by_length=group_by_length,
