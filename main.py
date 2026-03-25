@@ -285,6 +285,10 @@ def read_options():
     parser.add_argument('--oracle_rank', default=512, type=int, help='Rank for the Oracle baseline.')
     parser.add_argument('--calc_cross_client_drift', action='store_true', default=False,
                         help='Whether to calculate cross-client drift via pairwise directional dispersion.')
+    parser.add_argument('--profile_system_costs', action='store_true', default=False,
+                        help='Enable lightweight system-cost profiling for local training and server SVD.')
+    parser.add_argument('--profile_warmup_steps', default=3, type=int,
+                        help='Number of local train steps to ignore as warmup when profiling step latency.')
     parser.add_argument('--fedhera_server_agg',
                         default='original',
                         type=str,
@@ -688,12 +692,65 @@ def compute_pairwise_directional_dispersion(client_dense_updates, eps=1e-12):
     }
 
 
+def _summarize_system_costs(args, output_dir, profile_metrics):
+    if not profile_metrics:
+        return None
+
+    def _mean(vals):
+        return float(np.mean(vals)) if vals else None
+
+    def _std(vals):
+        return float(np.std(vals)) if vals else None
+
+    client_latency = profile_metrics.get("client_step_latency_ms_values", [])
+    peak_mem = profile_metrics.get("peak_gpu_mem_mb_values", [])
+    server_svd = profile_metrics.get("server_svd_time_ms_per_round", [])
+
+    summary = {
+        "setting_name": str(args.session_name),
+        "aggregation": str(args.aggregation),
+        "global_model": str(args.global_model),
+        "data_path": str(args.data_path),
+        "avg_client_step_latency_ms": _mean(client_latency),
+        "std_client_step_latency_ms": _std(client_latency),
+        "avg_peak_gpu_mem_mb": _mean(peak_mem),
+        "max_peak_gpu_mem_mb": float(max(peak_mem)) if peak_mem else None,
+        "avg_server_svd_time_ms_per_round": _mean(server_svd),
+        "std_server_svd_time_ms_per_round": _std(server_svd),
+        "num_profiled_clients": len(client_latency),
+        "num_profiled_rounds": len(profile_metrics.get("round_client_step_latency_ms", [])),
+        "num_profiled_server_rounds": len(server_svd),
+        "round_client_step_latency_ms": profile_metrics.get("round_client_step_latency_ms", []),
+        "round_peak_gpu_mem_mb": profile_metrics.get("round_peak_gpu_mem_mb", []),
+        "server_svd_time_ms_per_round": server_svd,
+        "profile_warmup_steps": int(args.profile_warmup_steps),
+    }
+
+    summary_path = os.path.join(output_dir, "system_costs_summary.json")
+    os.makedirs(output_dir, exist_ok=True)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    logging.info("[SystemCostSummary] %s", summary)
+    logging.info("[SystemCostSummary] Saved to %s", summary_path)
+    return summary
+
+
 # training for FL setting
 def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_local, config=None, config_types=None):
     logging.info("The process of federated instruction-tuning has started..")
     reset_traffic_stats()
     previously_selected_clients_set = set()
     output_dir = os.path.join(output_dir, str(args.num_clients))
+    system_cost_profile = None
+    if args.profile_system_costs:
+        system_cost_profile = {
+            "client_step_latency_ms_values": [],
+            "peak_gpu_mem_mb_values": [],
+            "round_client_step_latency_ms": [],
+            "round_peak_gpu_mem_mb": [],
+            "server_svd_time_ms_per_round": [],
+        }
 
     local_dataset_len_dict = dict()
     best_rouge_L = 0
@@ -749,6 +806,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
         local_eval_rouge_L = 0
         total_data_num = 0
         cross_client_dense_updates = {} if args.calc_cross_client_drift else None
+        round_step_latency_values = [] if args.profile_system_costs else None
+        round_peak_gpu_mem_values = [] if args.profile_system_costs else None
         logging.info("\In Epoch " + str(epoch))
         logging.info("\nConducting the client selection")
 
@@ -859,12 +918,31 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                                        args.local_num_epochs,
                                        args.local_learning_rate,
                                        args.group_by_length,
-                                       args.warmup)
+                                       args.warmup,
+                                       profile_system_costs=args.profile_system_costs,
+                                       profile_warmup_steps=args.profile_warmup_steps)
             client.initiate_local_training()
 
             logging.info("Local training starts ... ")
             local_train_result = client.train()
             local_train_results += float(local_train_result['eval_loss']) * local_dataset_len_dict[client_id]
+            if args.profile_system_costs and client.latest_system_profile is not None:
+                prof = client.latest_system_profile
+                if prof.get("avg_step_latency_ms") is not None:
+                    round_step_latency_values.append(float(prof["avg_step_latency_ms"]))
+                    system_cost_profile["client_step_latency_ms_values"].append(float(prof["avg_step_latency_ms"]))
+                if prof.get("peak_gpu_mem_mb") is not None:
+                    round_peak_gpu_mem_values.append(float(prof["peak_gpu_mem_mb"]))
+                    system_cost_profile["peak_gpu_mem_mb_values"].append(float(prof["peak_gpu_mem_mb"]))
+                logging.info(
+                    "[SystemProfile][epoch %d][client %s] avg_step_latency_ms=%s peak_gpu_mem_mb=%s measured_steps=%d warmup_steps=%d",
+                    epoch,
+                    str(client_id),
+                    "None" if prof.get("avg_step_latency_ms") is None else f"{prof['avg_step_latency_ms']:.3f}",
+                    "None" if prof.get("peak_gpu_mem_mb") is None else f"{prof['peak_gpu_mem_mb']:.3f}",
+                    int(prof.get("num_measured_steps", 0)),
+                    int(prof.get("warmup_steps", 0)),
+                )
 
             if args.calc_cross_client_drift:
                 try:
@@ -944,6 +1022,19 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                     )
             except Exception as e:
                 logging.error("[CrossClientDrift][epoch %d] Failed to compute dispersion: %s", epoch, str(e))
+        if args.profile_system_costs:
+            if round_step_latency_values:
+                round_latency_mean = float(np.mean(round_step_latency_values))
+                system_cost_profile["round_client_step_latency_ms"].append(round_latency_mean)
+            if round_peak_gpu_mem_values:
+                round_peak_mean = float(np.mean(round_peak_gpu_mem_values))
+                system_cost_profile["round_peak_gpu_mem_mb"].append(round_peak_mean)
+            logging.info(
+                "[SystemProfile][epoch %d] round_avg_step_latency_ms=%s round_avg_peak_gpu_mem_mb=%s",
+                epoch,
+                "None" if not round_step_latency_values else f"{np.mean(round_step_latency_values):.3f}",
+                "None" if not round_peak_gpu_mem_values else f"{np.mean(round_peak_gpu_mem_values):.3f}",
+            )
         if args.aggregation == 'homo':
             global_params = FedAvg(selected_clients_set,
                                    output_dir,
@@ -973,6 +1064,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 atw_temperature=args.atw_temperature,
                 all_client_ids=list(range(args.num_clients)),
                 prev_global_params=dense_global_params if args.fedhera_server_agg == 'unbiased' else None,
+                profile_metrics=system_cost_profile if args.profile_system_costs else None,
             )
             if args.fedhera_server_agg == 'unbiased':
                 if new_global_params is not None:
@@ -1068,6 +1160,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                     logging.info("[TrafficSummary] %s", stats)
                 except Exception:
                     pass
+                if args.profile_system_costs:
+                    _summarize_system_costs(args, output_dir, system_cost_profile)
                 return
         local_dataset_len_dict = {}
         import gc
@@ -1079,6 +1173,8 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
         logging.info("[TrafficSummary] %s", stats)
     except Exception:
         pass
+    if args.profile_system_costs:
+        _summarize_system_costs(args, output_dir, system_cost_profile)
 
 
 def main():

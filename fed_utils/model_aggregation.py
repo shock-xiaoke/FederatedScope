@@ -6,6 +6,7 @@ import os
 from torch.nn.functional import normalize
 import gc
 import logging
+import time
 from tqdm import tqdm
 
 
@@ -650,7 +651,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             atw_temperature=2.0, 
             all_client_ids=None, 
             server_agg: str = "original", 
-            prev_global_params=None):
+            prev_global_params=None,
+            profile_metrics=None):
     """
     Fed-Hera aggregation:
     1) Merge client adapters into W_global.
@@ -699,6 +701,9 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
 
     weights_array = torch.tensor([local_dataset_len_dict[c] for c in selected_clients_set], dtype=torch.float32)
     weights_array = torch.nn.functional.normalize(weights_array, p=1, dim=0)
+    if profile_metrics is not None and use_gpu_svd and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    server_pipeline_start = time.perf_counter() if profile_metrics is not None else None
 
     # 1. Aggregation Phase
     server_agg_mode = str(server_agg or "original").lower()
@@ -1054,6 +1059,16 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
         round_transmit_bytes / MB,
         round_compute_bytes / MB,
     )
+    if profile_metrics is not None:
+        if use_gpu_svd and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        server_pipeline_ms = (time.perf_counter() - server_pipeline_start) * 1000.0
+        profile_metrics.setdefault("server_svd_time_ms_per_round", []).append(float(server_pipeline_ms))
+        logging.info(
+            "[SystemProfile][FedHera][epoch %d] server_svd_pipeline_ms=%.3f",
+            epoch,
+            server_pipeline_ms,
+        )
     aggregated = {k: v.detach().cpu() for k, v in aggregated.items()}
     _save_fedhera_dense_global(output_dir, epoch, aggregated)
     return aggregated

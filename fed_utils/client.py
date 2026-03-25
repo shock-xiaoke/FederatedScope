@@ -12,6 +12,46 @@ import logging
 import evaluate
 import numpy as np
 import math
+import time
+
+
+class StepLatencyProfilerCallback(transformers.TrainerCallback):
+    def __init__(self, warmup_steps=3, use_cuda=False):
+        self.warmup_steps = max(int(warmup_steps), 0)
+        self.use_cuda = bool(use_cuda)
+        self.step_start_time = None
+        self.timings_ms = []
+        self.num_seen_steps = 0
+
+    def _sync_cuda(self):
+        if self.use_cuda and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        self._sync_cuda()
+        self.step_start_time = time.perf_counter()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.step_start_time is None:
+            return
+        self._sync_cuda()
+        elapsed_ms = (time.perf_counter() - self.step_start_time) * 1000.0
+        self.num_seen_steps += 1
+        if self.num_seen_steps > self.warmup_steps:
+            self.timings_ms.append(elapsed_ms)
+        self.step_start_time = None
+
+    def summary(self):
+        if self.timings_ms:
+            avg_ms = float(sum(self.timings_ms) / len(self.timings_ms))
+        else:
+            avg_ms = None
+        return {
+            "avg_step_latency_ms": avg_ms,
+            "num_measured_steps": len(self.timings_ms),
+            "num_seen_steps": self.num_seen_steps,
+            "warmup_steps": self.warmup_steps,
+        }
 
 
 class GeneralClient:
@@ -37,6 +77,8 @@ class GeneralClient:
         self.dataloader_num_workers = dataloader_num_workers
         self.pin_memory = torch.cuda.is_available()
         self.active_lora_layers = None if active_lora_layers is None else set(active_lora_layers)
+        self.latest_system_profile = None
+        self.step_latency_profiler = None
 
     def compute_oracle_drift(self, global_params, oracle_r=4096, lora_alpha=16):
         """
@@ -270,6 +312,8 @@ class GeneralClient:
                             local_learning_rate,
                             group_by_length,
                             warmup=0,
+                            profile_system_costs=False,
+                            profile_warmup_steps=3,
                             lambd=None,
                             reg=None):
         
@@ -372,6 +416,13 @@ class GeneralClient:
                                                   compute_metrics=compute_metrics,
                                                   preprocess_logits_for_metrics=preprocess_logits_for_metrics
                                                   )
+        self.step_latency_profiler = None
+        if profile_system_costs:
+            self.step_latency_profiler = StepLatencyProfilerCallback(
+                warmup_steps=profile_warmup_steps,
+                use_cuda=use_cuda,
+            )
+            self.local_trainer.add_callback(self.step_latency_profiler)
 
     def initiate_local_training(self):
         self.model.config.use_cache = False
@@ -386,10 +437,37 @@ class GeneralClient:
         ).__get__(self.model, type(self.model))
 
     def train(self):
+        self.latest_system_profile = None
+        active_cuda_device = None
+        if torch.cuda.is_available():
+            try:
+                active_cuda_device = next(self.model.parameters()).device
+            except StopIteration:
+                active_cuda_device = None
+            if active_cuda_device is not None and active_cuda_device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(active_cuda_device)
+
         result = self.local_trainer.train()
         logging.info(self.local_trainer.state.log_history[-2])
         logging.info(self.local_trainer.state.log_history[-1])
         logging.info(result.metrics)
+
+        profiler_summary = None
+        if self.step_latency_profiler is not None:
+            profiler_summary = self.step_latency_profiler.summary()
+
+        peak_gpu_mem_mb = None
+        if active_cuda_device is not None and active_cuda_device.type == "cuda":
+            peak_gpu_mem_mb = float(torch.cuda.max_memory_allocated(active_cuda_device) / (1024.0 * 1024.0))
+
+        if profiler_summary is not None or peak_gpu_mem_mb is not None:
+            self.latest_system_profile = {
+                "avg_step_latency_ms": None if profiler_summary is None else profiler_summary["avg_step_latency_ms"],
+                "num_measured_steps": 0 if profiler_summary is None else profiler_summary["num_measured_steps"],
+                "num_seen_steps": 0 if profiler_summary is None else profiler_summary["num_seen_steps"],
+                "warmup_steps": 0 if profiler_summary is None else profiler_summary["warmup_steps"],
+                "peak_gpu_mem_mb": peak_gpu_mem_mb,
+            }
         return self.local_trainer.state.log_history[-2]
 
     def test(self, epoch, local_micro_batch_size):
