@@ -11,6 +11,7 @@ from .adaptive_peft import tokenize
 import logging
 import evaluate
 import numpy as np
+import math
 
 
 class GeneralClient:
@@ -158,7 +159,6 @@ class GeneralClient:
                     total_oracle_norm += oracle_norm.item()
         
         # 最终指标
-        import math
         relative_drift = math.sqrt(total_drift) / (math.sqrt(total_oracle_norm) + 1e-9)
         absolute_drift = math.sqrt(total_drift)
         
@@ -182,6 +182,49 @@ class GeneralClient:
         logging.info(f"Client {self.client_id} Drift Result: {relative_drift:.4f}")
         logging.info(f"Client {self.client_id} Absolute Drift: {absolute_drift:.4f}")
         return relative_drift
+
+    def reconstruct_dense_residual_update(self, lora_alpha=16):
+        """
+        Reconstruct this client's dense residual update in the common parameter space:
+            Delta W = B_up A_up * scale_up - B_init A_init * scale_init
+        """
+        dense_updates = OrderedDict()
+        total_sq_norm = 0.0
+
+        with torch.no_grad():
+            for name, param_A_up in self.model.named_parameters():
+                if "lora_A" not in name or "default" in name:
+                    continue
+
+                key_A = name
+                key_B = name.replace("lora_A", "lora_B")
+                base_key = ".".join(name.split(".")[:-3]) + ".lora"
+
+                try:
+                    param_B_up = self.model.get_parameter(key_B)
+                except Exception:
+                    continue
+
+                r_up = int(param_A_up.shape[0])
+                if r_up <= 0:
+                    continue
+                scale_up = float(lora_alpha) / float(max(r_up, 1))
+                delta_up = (param_B_up.detach().float() @ param_A_up.detach().float()) * scale_up
+
+                if key_A in self.params_dict_old and key_B in self.params_dict_old:
+                    param_A_init = self.params_dict_old[key_A].detach().float()
+                    param_B_init = self.params_dict_old[key_B].detach().float()
+                    r_init = int(param_A_init.shape[0])
+                    scale_init = float(lora_alpha) / float(max(r_init, 1))
+                    delta_init = (param_B_init @ param_A_init) * scale_init
+                else:
+                    delta_init = torch.zeros_like(delta_up)
+
+                delta = (delta_up - delta_init).cpu()
+                dense_updates[base_key] = delta
+                total_sq_norm += float(torch.sum(delta.float() * delta.float()).item())
+
+        return dense_updates, math.sqrt(max(total_sq_norm, 0.0))
     
     def generate_and_tokenize_prompt(self, data_point):
         full_prompt = self.prompter.generate_prompt(

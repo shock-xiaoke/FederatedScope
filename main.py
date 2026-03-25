@@ -22,6 +22,7 @@ import os
 import torch
 import logging
 import argparse
+import math
 os.environ["WANDB_MODE"]="disabled"
 
 import json
@@ -282,6 +283,8 @@ def read_options():
     parser.add_argument('--calc_drift', action='store_true', default=False,
                         help='Whether to calculate drift against a high-rank Oracle (Very slow!).')
     parser.add_argument('--oracle_rank', default=512, type=int, help='Rank for the Oracle baseline.')
+    parser.add_argument('--calc_cross_client_drift', action='store_true', default=False,
+                        help='Whether to calculate cross-client drift via pairwise directional dispersion.')
     parser.add_argument('--fedhera_server_agg',
                         default='original',
                         type=str,
@@ -561,6 +564,130 @@ def get_density(args, config_local, client_id, config_types):
     return density
 
 
+def compute_pairwise_directional_dispersion(client_dense_updates, eps=1e-12):
+    """
+    Compute cross-client drift in reconstructed dense update space.
+
+    Instead of flattening all layers at once, compute pairwise directional
+    dispersion per LoRA layer first, then aggregate layer scores using the
+    layer's mean update Frobenius norm as weight. This reduces domination by
+    a few large layers while still emphasizing layers with meaningful updates.
+    """
+    client_ids = list(client_dense_updates.keys())
+    if len(client_ids) < 2:
+        return None
+
+    all_layer_keys = sorted({
+        layer_key
+        for updates in client_dense_updates.values()
+        for layer_key in updates.keys()
+    })
+    if not all_layer_keys:
+        return None
+
+    total_weight = 0.0
+    weighted_dispersion_sum = 0.0
+    total_pairs = 0
+    zero_norm_pairs = 0
+    layer_stats = []
+
+    for layer_key in all_layer_keys:
+        layer_updates = {}
+        layer_norms = {}
+        layer_sq_norm_sum = 0.0
+        layer_numel = None
+
+        for client_id in client_ids:
+            tensor = client_dense_updates[client_id].get(layer_key)
+            if tensor is not None:
+                tensor_f = tensor.float()
+                layer_numel = tensor_f.numel()
+            else:
+                tensor_f = None
+            layer_updates[client_id] = tensor_f
+
+        if layer_numel is None:
+            continue
+
+        for client_id in client_ids:
+            tensor_f = layer_updates[client_id]
+            if tensor_f is None:
+                norm_val = 0.0
+            else:
+                norm_val = math.sqrt(float(torch.sum(tensor_f * tensor_f).item()))
+            layer_norms[client_id] = norm_val
+            layer_sq_norm_sum += norm_val * norm_val
+
+        pair_dispersion_sum = 0.0
+        pair_count = 0
+        layer_zero_norm_pairs = 0
+        for i in range(len(client_ids)):
+            for j in range(i + 1, len(client_ids)):
+                cid_i = client_ids[i]
+                cid_j = client_ids[j]
+                norm_i = layer_norms[cid_i]
+                norm_j = layer_norms[cid_j]
+
+                if norm_i <= eps and norm_j <= eps:
+                    cosine = 1.0
+                    layer_zero_norm_pairs += 1
+                elif norm_i <= eps or norm_j <= eps:
+                    cosine = 0.0
+                    layer_zero_norm_pairs += 1
+                else:
+                    dot = float(torch.sum(layer_updates[cid_i] * layer_updates[cid_j]).item())
+                    cosine = dot / max(norm_i * norm_j, eps)
+                    cosine = max(-1.0, min(1.0, cosine))
+
+                pair_dispersion_sum += (1.0 - cosine)
+                pair_count += 1
+
+        if pair_count == 0:
+            continue
+
+        layer_dispersion = pair_dispersion_sum / float(pair_count)
+        layer_weight = sum(layer_norms.values()) / float(len(client_ids))
+        weighted_dispersion_sum += layer_weight * layer_dispersion
+        total_weight += layer_weight
+        total_pairs += pair_count
+        zero_norm_pairs += layer_zero_norm_pairs
+        layer_stats.append({
+            "layer": layer_key,
+            "dispersion": layer_dispersion,
+            "weight": layer_weight,
+            "mean_update_norm": layer_weight,
+            "param_count": layer_numel,
+        })
+
+    if not layer_stats:
+        return None
+
+    layer_stats.sort(key=lambda x: x["weight"], reverse=True)
+    if total_weight <= eps:
+        dispersion = sum(x["dispersion"] for x in layer_stats) / float(len(layer_stats))
+    else:
+        dispersion = weighted_dispersion_sum / total_weight
+
+    global_client_norms = {}
+    for client_id in client_ids:
+        sq_norm = 0.0
+        for tensor in client_dense_updates[client_id].values():
+            sq_norm += float(torch.sum(tensor.float() * tensor.float()).item())
+        global_client_norms[client_id] = math.sqrt(max(sq_norm, 0.0))
+
+    return {
+        "dispersion": dispersion,
+        "num_clients": len(client_ids),
+        "num_pairs": total_pairs,
+        "zero_norm_pairs": zero_norm_pairs,
+        "num_layers": len(layer_stats),
+        "mean_client_update_norm": sum(global_client_norms.values()) / float(len(global_client_norms)),
+        "max_client_update_norm": max(global_client_norms.values()) if global_client_norms else 0.0,
+        "min_client_update_norm": min(global_client_norms.values()) if global_client_norms else 0.0,
+        "layer_stats_top": layer_stats[:3],
+    }
+
+
 # training for FL setting
 def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_local, config=None, config_types=None):
     logging.info("The process of federated instruction-tuning has started..")
@@ -621,6 +748,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
         local_eval_rouge_1 = 0
         local_eval_rouge_L = 0
         total_data_num = 0
+        cross_client_dense_updates = {} if args.calc_cross_client_drift else None
         logging.info("\In Epoch " + str(epoch))
         logging.info("\nConducting the client selection")
 
@@ -738,6 +866,27 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             local_train_result = client.train()
             local_train_results += float(local_train_result['eval_loss']) * local_dataset_len_dict[client_id]
 
+            if args.calc_cross_client_drift:
+                try:
+                    dense_update_dict, dense_update_norm = client.reconstruct_dense_residual_update(
+                        lora_alpha=args.lora_alpha
+                    )
+                    cross_client_dense_updates[int(client_id)] = dense_update_dict
+                    logging.info(
+                        "[CrossClientDrift][epoch %d][client %s] dense_update_layers=%d update_norm=%.6f",
+                        epoch,
+                        str(client_id),
+                        len(dense_update_dict),
+                        dense_update_norm,
+                    )
+                except Exception as e:
+                    logging.error(
+                        "[CrossClientDrift][epoch %d][client %s] Failed to reconstruct dense update: %s",
+                        epoch,
+                        str(client_id),
+                        str(e),
+                    )
+
             if (epoch > 0) and args.calc_drift:
                 if k == 0: 
                     try:
@@ -764,6 +913,37 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
             del client
 
             logging.info("Collecting the weights of clients and performing aggregation")
+        if args.calc_cross_client_drift and cross_client_dense_updates:
+            try:
+                dispersion_stats = compute_pairwise_directional_dispersion(cross_client_dense_updates)
+                if dispersion_stats is not None:
+                    logging.info(
+                        "[CrossClientDrift] Epoch %d Algorithm %s Dispersion %.6f NumClients %d NumPairs %d NumLayers %d ZeroNormPairs %d MeanUpdateNorm %.6f MinUpdateNorm %.6f MaxUpdateNorm %.6f",
+                        epoch,
+                        args.aggregation,
+                        dispersion_stats["dispersion"],
+                        dispersion_stats["num_clients"],
+                        dispersion_stats["num_pairs"],
+                        dispersion_stats["num_layers"],
+                        dispersion_stats["zero_norm_pairs"],
+                        dispersion_stats["mean_client_update_norm"],
+                        dispersion_stats["min_client_update_norm"],
+                        dispersion_stats["max_client_update_norm"],
+                    )
+                    logging.info(
+                        "[CrossClientDrift][TopLayers] Epoch %d %s",
+                        epoch,
+                        [
+                            {
+                                "layer": item["layer"],
+                                "dispersion": round(item["dispersion"], 6),
+                                "weight": round(item["weight"], 6),
+                            }
+                            for item in dispersion_stats["layer_stats_top"]
+                        ],
+                    )
+            except Exception as e:
+                logging.error("[CrossClientDrift][epoch %d] Failed to compute dispersion: %s", epoch, str(e))
         if args.aggregation == 'homo':
             global_params = FedAvg(selected_clients_set,
                                    output_dir,
