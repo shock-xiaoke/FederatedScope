@@ -652,7 +652,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
             all_client_ids=None, 
             server_agg: str = "original", 
             prev_global_params=None,
-            profile_metrics=None):
+            profile_metrics=None,
+            force_coupled=False):
     """
     Fed-Hera aggregation:
     1) Merge client adapters into W_global.
@@ -930,6 +931,16 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
                 r_tot, _ = allocate_r_tot_for_client(layers, B_down_bytes, bytes_per_col)
             r_main, _, _ = allocate_r_main_for_client(layers, r_tot, M_bytes, T_ms, c_mem_per_col, c_time_per_col)
 
+        if force_coupled:
+            r_tot = {
+                layer_key: int(min(r_tot.get(layer_key, 0), r_main.get(layer_key, 0)))
+                for layer_key in layers.keys()
+            }
+            r_main = {
+                layer_key: int(r_tot.get(layer_key, 0))
+                for layer_key in layers.keys()
+            }
+
         # [ATW Logic] Calculate Lambda for this client
         lambda_val = 1.0 # Default Static
         if use_atw:
@@ -1039,6 +1050,8 @@ def FedHera(selected_clients_set, output_dir, local_dataset_len_dict, epoch,
         if rank_summary:
             rank_summary_top = dict(list(rank_summary.items())[:2])
             logging.info("[FedHera][epoch %d][client %s] ranks(top)=%s", epoch, str(client_id), rank_summary_top)
+        if force_coupled:
+            logging.info("[FedHera][epoch %d][client %s] coupled_mode=True (r_tot=r_main)", epoch, str(client_id))
         comm_util = (client_transmit_bytes / float(B_down_bytes)) if B_down_bytes > 0 else 0.0
         comp_util = (comp_time_ms / float(T_ms)) if T_ms > 0 else 0.0
         logging.info(

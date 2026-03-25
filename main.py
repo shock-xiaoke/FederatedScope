@@ -289,6 +289,8 @@ def read_options():
                         help='Enable lightweight system-cost profiling for local training and server SVD.')
     parser.add_argument('--profile_warmup_steps', default=3, type=int,
                         help='Number of local train steps to ignore as warmup when profiling step latency.')
+    parser.add_argument('--fedhera_coupled', action='store_true', default=False,
+                        help='Force coupled FedHera setting with r_tot = r_train (i.e., r_tot = r_main).')
     parser.add_argument('--fedhera_server_agg',
                         default='original',
                         type=str,
@@ -1065,6 +1067,7 @@ def FL_training(model, tokenizer, prompter, data_path, output_dir, args, config_
                 all_client_ids=list(range(args.num_clients)),
                 prev_global_params=dense_global_params if args.fedhera_server_agg == 'unbiased' else None,
                 profile_metrics=system_cost_profile if args.profile_system_costs else None,
+                force_coupled=args.fedhera_coupled,
             )
             if args.fedhera_server_agg == 'unbiased':
                 if new_global_params is not None:
