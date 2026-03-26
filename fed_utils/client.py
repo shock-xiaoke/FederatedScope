@@ -13,6 +13,7 @@ import evaluate
 import numpy as np
 import math
 import time
+import gc
 
 
 class StepLatencyProfilerCallback(transformers.TrainerCallback):
@@ -254,8 +255,8 @@ class GeneralClient:
                 delta_up = (param_B_up.detach().float() @ param_A_up.detach().float()) * scale_up
 
                 if key_A in self.params_dict_old and key_B in self.params_dict_old:
-                    param_A_init = self.params_dict_old[key_A].detach().float()
-                    param_B_init = self.params_dict_old[key_B].detach().float()
+                    param_A_init = self.params_dict_old[key_A].detach().to(device=param_A_up.device, dtype=torch.float32)
+                    param_B_init = self.params_dict_old[key_B].detach().to(device=param_B_up.device, dtype=torch.float32)
                     r_init = int(param_A_init.shape[0])
                     scale_init = float(lora_alpha) / float(max(r_init, 1))
                     delta_init = (param_B_init @ param_A_init) * scale_init
@@ -426,10 +427,12 @@ class GeneralClient:
 
     def initiate_local_training(self):
         self.model.config.use_cache = False
-        self.params_dict_old = copy.deepcopy(
-            OrderedDict((name, param.detach()) for name, param in self.model.named_parameters() if "lora" in name))
+        self.params_dict_old = OrderedDict(
+            (name, param.detach().cpu().clone()) for name, param in self.model.named_parameters() if "lora" in name)
         self.params_dict_new = OrderedDict(
             (name, param.detach()) for name, param in self.model.named_parameters() if "lora" in name)
+        if not hasattr(self.model, "_fedhera_original_state_dict"):
+            self.model._fedhera_original_state_dict = self.model.state_dict
         self.model.state_dict = (
             lambda instance, *_, **__: get_peft_model_state_dict(
                 instance, self.params_dict_new, "local" 
@@ -592,6 +595,15 @@ class GeneralClient:
         torch.save(lora_params, single_output_dir + "/pytorch_model.bin")
 
         _ = self.model.load_state_dict(self.params_dict_old, strict=False)
+        if hasattr(self.model, "_fedhera_original_state_dict"):
+            self.model.state_dict = self.model._fedhera_original_state_dict
+        self.local_trainer = None
+        self.step_latency_profiler = None
+        self.params_dict_new = None
+        self.latest_system_profile = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         previously_selected_clients_set = previously_selected_clients_set | set({self.client_id})
         last_client_id = self.client_id
         return self.model, local_dataset_len_dict, previously_selected_clients_set, last_client_id

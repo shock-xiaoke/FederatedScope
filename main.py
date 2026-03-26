@@ -315,14 +315,48 @@ def model_and_tokenizer(global_model, device_map='cuda'):
     if isinstance(device_map, str) and device_map.lower() in ["cuda", "gpu", "single", "0"]:
         map_arg = {"": 0}
 
-    # 1. 加载模型：增加 attn_implementation="flash_attention_2"
-    # Llama-3.2 强烈建议使用 bfloat16 和 Flash Attention 2
-    model = AutoModelForCausalLM.from_pretrained(
+    use_cuda = torch.cuda.is_available()
+    major, _ = torch.cuda.get_device_capability(0) if use_cuda else (0, 0)
+    if use_cuda and major >= 8:
+        model_dtype = torch.bfloat16
+    elif use_cuda:
+        model_dtype = torch.float16
+    else:
+        model_dtype = torch.float32
+
+    model_load_kwargs = {
+        "device_map": map_arg,
+        "trust_remote_code": True,
+        "torch_dtype": model_dtype,
+    }
+    if use_cuda:
+        model_load_kwargs["attn_implementation"] = "flash_attention_2"
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            global_model,
+            **model_load_kwargs,
+        )
+    except Exception as e:
+        if model_load_kwargs.get("attn_implementation") == "flash_attention_2":
+            logging.warning(
+                "Failed to load %s with flash_attention_2 (%s). Falling back to default attention.",
+                global_model,
+                str(e),
+            )
+            model_load_kwargs.pop("attn_implementation", None)
+            model = AutoModelForCausalLM.from_pretrained(
+                global_model,
+                **model_load_kwargs,
+            )
+        else:
+            raise
+
+    logging.info(
+        "Loaded model %s with dtype=%s attn_implementation=%s",
         global_model,
-        device_map=map_arg,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",  # [新增] 适配 Llama-3.2
+        str(model_dtype).replace("torch.", ""),
+        model_load_kwargs.get("attn_implementation", "default"),
     )
     
     # 启用梯度检查点时的参数更新
