@@ -80,6 +80,12 @@ class GeneralClient:
         self.active_lora_layers = None if active_lora_layers is None else set(active_lora_layers)
         self.latest_system_profile = None
         self.step_latency_profiler = None
+        if not hasattr(self.model, "_fedhera_original_forward"):
+            self.model._fedhera_original_forward = self.model.forward
+
+    def _restore_model_forward(self):
+        if hasattr(self.model, "_fedhera_original_forward"):
+            self.model.forward = self.model._fedhera_original_forward
 
     def compute_oracle_drift(self, global_params, oracle_r=4096, lora_alpha=16):
         """
@@ -317,6 +323,7 @@ class GeneralClient:
                             profile_warmup_steps=3,
                             lambd=None,
                             reg=None):
+        self._restore_model_forward()
         
         def preprocess_logits_for_metrics(logits, labels):
             """
@@ -451,6 +458,7 @@ class GeneralClient:
                 torch.cuda.reset_peak_memory_stats(active_cuda_device)
 
         result = self.local_trainer.train()
+        self._restore_model_forward()
         logging.info(self.local_trainer.state.log_history[-2])
         logging.info(self.local_trainer.state.log_history[-1])
         logging.info(result.metrics)
@@ -474,6 +482,7 @@ class GeneralClient:
         return self.local_trainer.state.log_history[-2]
 
     def test(self, epoch, local_micro_batch_size):
+        self._restore_model_forward()
         use_cuda = torch.cuda.is_available()
         major, _ = torch.cuda.get_device_capability(0) if use_cuda else (0, 0)
         use_bf16 = use_cuda and major >= 8
@@ -580,6 +589,11 @@ class GeneralClient:
         )
         eval_dataset = self.local_eval_dataset
         eval_results = tester.evaluate(eval_dataset)
+        self._restore_model_forward()
+        del tester
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         logging.info('For client ' + str(self.client_id) + ', the eval result is:')
         logging.info(eval_results)
         return eval_results
@@ -595,6 +609,7 @@ class GeneralClient:
         torch.save(lora_params, single_output_dir + "/pytorch_model.bin")
 
         _ = self.model.load_state_dict(self.params_dict_old, strict=False)
+        self._restore_model_forward()
         if hasattr(self.model, "_fedhera_original_state_dict"):
             self.model.state_dict = self.model._fedhera_original_state_dict
         self.local_trainer = None
